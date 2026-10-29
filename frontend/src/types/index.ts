@@ -159,6 +159,7 @@ export interface ChatbotConfig {
   poll_interval_seconds: number;
   max_reply_length: number;
   allowed_contacts: string[];
+  max_replies_per_contact_window: number;
   max_replies_per_window: number;
   rate_limit_window_minutes: number;
   system_prompt_extra: string;
@@ -171,6 +172,7 @@ export interface ChatbotConfigUpdateRequest {
   auto_reply_enabled?: boolean;
   poll_interval_seconds?: number;
   max_reply_length?: number;
+  max_replies_per_contact_window?: number;
   max_replies_per_window?: number;
   rate_limit_window_minutes?: number;
   system_prompt_extra?: string;

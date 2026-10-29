@@ -1208,7 +1208,7 @@ def test_stuck_generating_recovered_on_startup():
 
 
 @pytest.mark.asyncio
-async def test_browser_send_error_transitions_to_send_unconfirmed():
+async def test_browser_send_error_transitions_to_send_unconfirmed(mock_chatbot_server: str, monkeypatch):
     """Verify that browser send error transitions the message to SEND_UNCONFIRMED without duplicate retry."""
     contact = f"BrowserErrContact_{uuid.uuid4().hex[:6]}"
     chatbot_store.add_contact(contact)
@@ -1222,33 +1222,47 @@ async def test_browser_send_error_transitions_to_send_unconfirmed():
         lambda prompt: '{"reply": "Outgoing test reply", "intent": "casual", "confidence": 0.9, "requires_manual_review": false}'
     )
 
-    try:
-        service = WhatsAppChatbotService()
-        fp = f"browser-err-fp-{uuid.uuid4()}"
-        record = chatbot_store.record_detected_message(
-            fingerprint=fp,
-            contact_name=contact,
-            incoming_text="Testing browser failure",
-            timestamp_str="12:45"
-        )
-        assert record is not None
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+        await page.goto(f"{mock_chatbot_server}/test-whatsapp")
 
-        # Ensure page is None so browser send cannot proceed
-        service._page = None
+        # Set active chat header to match contact
+        await page.evaluate(f"() => {{ document.getElementById('chat-header-name').innerText = '{contact}'; }}")
 
-        await service._handle_message_reply_pipeline(
-            record=record,
-            config=config,
-            t_detect_start=time.perf_counter()
-        )
+        # Simulate browser error during click_send_button_once
+        async def mock_fail_send(*args, **kwargs):
+            raise Exception("Simulated Playwright element detached during send")
 
-        updated = chatbot_store.get_message_by_id(record.id)
-        assert updated is not None
-        # Browser page unavailable -> READY_TO_SEND with abort reason, or SEND_UNCONFIRMED if failed during send
-        assert updated.status in (ChatbotMessageStatusEnum.READY_TO_SEND, ChatbotMessageStatusEnum.SEND_UNCONFIRMED)
-        assert updated.skip_reason is not None
-    finally:
-        chatbot_reply_service.set_mock_responder(None)
+        monkeypatch.setattr(whatsapp_service, "_click_send_button_once", mock_fail_send)
+
+        try:
+            service = WhatsAppChatbotService()
+            fp = f"browser-err-fp-{uuid.uuid4()}"
+            record = chatbot_store.record_detected_message(
+                fingerprint=fp,
+                contact_name=contact,
+                incoming_text="Testing browser failure",
+                timestamp_str="12:45"
+            )
+            assert record is not None
+
+            await service._handle_message_reply_pipeline(
+                page=page,
+                record=record,
+                config=config,
+                t_detect_start=time.perf_counter()
+            )
+
+            updated = chatbot_store.get_message_by_id(record.id)
+            assert updated is not None
+            # Must transition to SEND_UNCONFIRMED
+            assert updated.status == ChatbotMessageStatusEnum.SEND_UNCONFIRMED
+            assert "browser error" in updated.skip_reason.lower()
+            assert updated.total_duration_ms is not None
+        finally:
+            chatbot_reply_service.set_mock_responder(None)
+            await browser.close()
 
 
 @pytest.mark.asyncio
@@ -1273,5 +1287,185 @@ async def test_concurrent_messages_serialized_per_contact():
 
     # Task 1 must start and end before Task 2 can start because of per-contact lock
     assert execution_order == ["start_1", "end_1", "start_2", "end_2"]
+
+
+def test_config_save_accepts_5_and_50():
+    """Verify backend accepts 5 and 50 for max replies, persists the value, and returns both field aliases."""
+    client = TestClient(app)
+
+    # 1. Save 5 via max_replies_per_window
+    res5 = client.post("/api/chatbot/config", json={"max_replies_per_window": 5})
+    assert res5.status_code == 200
+    data5 = res5.json()
+    assert data5["max_replies_per_window"] == 5
+    assert data5["max_replies_per_contact_window"] == 5
+
+    # 2. Save 50 via max_replies_per_window
+    res50 = client.post("/api/chatbot/config", json={"max_replies_per_window": 50})
+    assert res50.status_code == 200
+    data50 = res50.json()
+    assert data50["max_replies_per_window"] == 50
+    assert data50["max_replies_per_contact_window"] == 50
+
+    # 3. Verify persisted in database via GET /api/chatbot/config
+    get_res = client.get("/api/chatbot/config")
+    assert get_res.status_code == 200
+    get_data = get_res.json()
+    assert get_data["max_replies_per_window"] == 50
+    assert get_data["max_replies_per_contact_window"] == 50
+
+    # 4. Verify status response contains the saved value
+    status_res = client.get("/api/chatbot/status")
+    assert status_res.status_code == 200
+    status_data = status_res.json()
+    assert status_data["config"]["max_replies_per_window"] == 50
+    assert status_data["config"]["max_replies_per_contact_window"] == 50
+
+    # 5. Save 50 via max_replies_per_contact_window
+    res_contact = client.post("/api/chatbot/config", json={"max_replies_per_contact_window": 50})
+    assert res_contact.status_code == 200
+    assert res_contact.json()["max_replies_per_contact_window"] == 50
+
+    # Reset back to default 5 for clean test isolation
+    client.post("/api/chatbot/config", json={"max_replies_per_contact_window": 5})
+
+
+def test_config_save_rejects_values_above_50_or_below_1():
+    """Verify backend rejects values above 50 or below 1 with 422 Unprocessable Entity."""
+    client = TestClient(app)
+
+    # 51 must be rejected
+    res_51 = client.post("/api/chatbot/config", json={"max_replies_per_window": 51})
+    assert res_51.status_code == 422
+
+    # 100 must be rejected
+    res_100 = client.post("/api/chatbot/config", json={"max_replies_per_contact_window": 100})
+    assert res_100.status_code == 422
+
+    # 0 must be rejected
+    res_0 = client.post("/api/chatbot/config", json={"max_replies_per_window": 0})
+    assert res_0.status_code == 422
+
+    # Negative value must be rejected
+    res_neg = client.post("/api/chatbot/config", json={"max_replies_per_contact_window": -1})
+    assert res_neg.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_enforced_at_50(mock_chatbot_server: str):
+    """Verify rate limit is enforced at 50 replies per window."""
+    contact = f"Limit50Contact_{uuid.uuid4().hex[:6]}"
+    chatbot_store.add_contact(contact)
+
+    config = chatbot_store.get_config()
+    config.enabled = True
+    config.auto_reply_enabled = False
+    config.max_replies_per_contact_window = 50
+    config.rate_limit_window_minutes = 15
+    chatbot_store.save_config(config)
+
+    # Seed 50 SENT replies in SQLite
+    for i in range(50):
+        fp = f"limit50-seed-{contact}-{i}"
+        rec = chatbot_store.record_detected_message(
+            fingerprint=fp,
+            contact_name=contact,
+            incoming_text=f"Msg {i}",
+            timestamp_str="12:00"
+        )
+        assert rec is not None
+        chatbot_store.update_message_status(rec.id, ChatbotMessageStatusEnum.SENT, reply_text=f"Reply {i}")
+
+    # Count must be exactly 50
+    recent = chatbot_store.count_recent_replies(contact, 15)
+    assert recent == 50
+
+    # Attempt 51st message
+    service = WhatsAppChatbotService()
+    fp_51 = f"limit50-msg-51-{contact}"
+    rec_51 = chatbot_store.record_detected_message(
+        fingerprint=fp_51,
+        contact_name=contact,
+        incoming_text="Msg 51",
+        timestamp_str="12:01"
+    )
+    assert rec_51 is not None
+
+    await service._handle_message_reply_pipeline(
+        record=rec_51,
+        config=config,
+        t_detect_start=time.perf_counter()
+    )
+
+    updated_51 = chatbot_store.get_message_by_id(rec_51.id)
+    assert updated_51 is not None
+    assert updated_51.status == ChatbotMessageStatusEnum.SKIPPED
+    assert "Rate limit reached (50/50 in 15m)" in updated_51.skip_reason
+
+
+@pytest.mark.asyncio
+async def test_generated_proposals_not_counted_against_rate_limit(mock_chatbot_server: str):
+    """Verify generated candidate proposals (READY_TO_SEND) do not count as sent replies against rate limits."""
+    contact = f"ProposalCountContact_{uuid.uuid4().hex[:6]}"
+    chatbot_store.add_contact(contact)
+
+    config = chatbot_store.get_config()
+    config.enabled = True
+    config.auto_reply_enabled = False
+    config.max_replies_per_contact_window = 5
+    config.rate_limit_window_minutes = 15
+    chatbot_store.save_config(config)
+
+    # Seed 5 READY_TO_SEND candidate proposals (NOT sent)
+    for i in range(5):
+        fp = f"proposal-seed-{contact}-{i}"
+        rec = chatbot_store.record_detected_message(
+            fingerprint=fp,
+            contact_name=contact,
+            incoming_text=f"Proposal Msg {i}",
+            timestamp_str="12:10"
+        )
+        assert rec is not None
+        chatbot_store.update_message_status(
+            rec.id,
+            ChatbotMessageStatusEnum.READY_TO_SEND,
+            reply_text=f"Candidate reply {i}",
+            skip_reason="Automatic sending mode is disabled."
+        )
+
+    # Proposals must NOT be counted as sent replies!
+    sent_count = chatbot_store.count_recent_replies(contact, 15)
+    assert sent_count == 0
+
+    # 6th message should NOT be rate limited
+    chatbot_reply_service.set_mock_responder(
+        lambda prompt: '{"reply": "6th reply", "intent": "greeting", "confidence": 0.95, "requires_manual_review": false}'
+    )
+
+    try:
+        service = WhatsAppChatbotService()
+        fp_6 = f"proposal-msg-6-{contact}"
+        rec_6 = chatbot_store.record_detected_message(
+            fingerprint=fp_6,
+            contact_name=contact,
+            incoming_text="Proposal Msg 6",
+            timestamp_str="12:11"
+        )
+        assert rec_6 is not None
+
+        await service._handle_message_reply_pipeline(
+            record=rec_6,
+            config=config,
+            t_detect_start=time.perf_counter()
+        )
+
+        updated_6 = chatbot_store.get_message_by_id(rec_6.id)
+        assert updated_6 is not None
+        # Must be READY_TO_SEND, not SKIPPED for rate limits!
+        assert updated_6.status == ChatbotMessageStatusEnum.READY_TO_SEND
+        assert updated_6.reply_text == "6th reply"
+    finally:
+        chatbot_reply_service.set_mock_responder(None)
+
 
 

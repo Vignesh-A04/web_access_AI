@@ -74,11 +74,13 @@ export const WhatsAppChatbotView: React.FC<WhatsAppChatbotViewProps> = ({ health
       const data = await fetchChatbotStatus();
       setStatusData(data);
       if (!configSaving) {
+        const maxReplies = data.config.max_replies_per_contact_window ?? data.config.max_replies_per_window ?? 5;
         setConfigEditing({
           auto_reply_enabled: data.config.auto_reply_enabled,
           poll_interval_seconds: data.config.poll_interval_seconds,
           max_reply_length: data.config.max_reply_length,
-          max_replies_per_window: data.config.max_replies_per_window,
+          max_replies_per_contact_window: maxReplies,
+          max_replies_per_window: maxReplies,
           rate_limit_window_minutes: data.config.rate_limit_window_minutes,
         });
       }
@@ -158,10 +160,12 @@ export const WhatsAppChatbotView: React.FC<WhatsAppChatbotViewProps> = ({ health
     setConfigSaving(true);
     setErrorMsg(null);
     try {
+      const maxReplies = configEditing.max_replies_per_contact_window ?? configEditing.max_replies_per_window ?? 5;
       const updated = await updateChatbotConfig({
         poll_interval_seconds: configEditing.poll_interval_seconds,
         max_reply_length: configEditing.max_reply_length,
-        max_replies_per_window: configEditing.max_replies_per_window,
+        max_replies_per_contact_window: maxReplies,
+        max_replies_per_window: maxReplies,
         rate_limit_window_minutes: configEditing.rate_limit_window_minutes,
       });
       setStatusData(prev => prev ? { ...prev, config: updated } : null);
@@ -786,8 +790,15 @@ export const WhatsAppChatbotView: React.FC<WhatsAppChatbotViewProps> = ({ health
                 type="number"
                 min="1"
                 max="50"
-                value={configEditing.max_replies_per_window ?? 5}
-                onChange={e => setConfigEditing({ ...configEditing, max_replies_per_window: Number(e.target.value) })}
+                value={configEditing.max_replies_per_contact_window ?? configEditing.max_replies_per_window ?? 5}
+                onChange={e => {
+                  const val = Number(e.target.value);
+                  setConfigEditing(prev => ({
+                    ...prev,
+                    max_replies_per_contact_window: val,
+                    max_replies_per_window: val,
+                  }));
+                }}
                 style={{
                   width: '100%',
                   padding: '0.5rem',

@@ -204,10 +204,11 @@ class ChatbotConfigModel(BaseModel):
     auto_reply_enabled: bool = False
     allowed_contacts: List[str] = Field(default_factory=list)
     paused_contacts: List[str] = Field(default_factory=list)
-    poll_interval_seconds: float = 3.0
-    max_reply_length: int = 160
-    max_replies_per_contact_window: int = 5
-    rate_limit_window_minutes: int = 15
+    poll_interval_seconds: float = Field(default=3.0, ge=1.0)
+    max_reply_length: int = Field(default=160, ge=10, le=1000)
+    max_replies_per_contact_window: int = Field(default=5, ge=1, le=50)
+    max_replies_per_window: Optional[int] = Field(default=None, ge=1, le=50)
+    rate_limit_window_minutes: int = Field(default=15, ge=1, le=120)
     allow_group_replies: bool = False
     system_instructions: str = (
         "You are a friendly, helpful assistant on WhatsApp. "
@@ -217,19 +218,66 @@ class ChatbotConfigModel(BaseModel):
     cdp_url: Optional[str] = None
     target_url: Optional[str] = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def sync_config_fields(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            m_win = data.get("max_replies_per_window")
+            m_contact = data.get("max_replies_per_contact_window")
+            if m_contact is None and m_win is not None:
+                data["max_replies_per_contact_window"] = m_win
+            elif m_contact is not None and m_win is None:
+                data["max_replies_per_window"] = m_contact
+            elif m_contact is not None and m_win is not None:
+                data["max_replies_per_contact_window"] = m_contact
+                data["max_replies_per_window"] = m_contact
+        return data
+
+    @model_validator(mode="after")
+    def sync_config_fields_after(self) -> "ChatbotConfigModel":
+        if self.max_replies_per_window is None:
+            self.max_replies_per_window = self.max_replies_per_contact_window
+        else:
+            self.max_replies_per_contact_window = self.max_replies_per_window
+        return self
+
 
 class ChatbotConfigUpdateRequest(BaseModel):
     """Payload to update chatbot runtime configuration."""
     enabled: Optional[bool] = None
     auto_reply_enabled: Optional[bool] = None
-    poll_interval_seconds: Optional[float] = None
-    max_reply_length: Optional[int] = None
-    max_replies_per_contact_window: Optional[int] = None
-    rate_limit_window_minutes: Optional[int] = None
+    poll_interval_seconds: Optional[float] = Field(default=None, ge=1.0)
+    max_reply_length: Optional[int] = Field(default=None, ge=10, le=1000)
+    max_replies_per_contact_window: Optional[int] = Field(default=None, ge=1, le=50)
+    max_replies_per_window: Optional[int] = Field(default=None, ge=1, le=50)
+    rate_limit_window_minutes: Optional[int] = Field(default=None, ge=1, le=120)
     allow_group_replies: Optional[bool] = None
     system_instructions: Optional[str] = None
     cdp_url: Optional[str] = None
     target_url: Optional[str] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def sync_update_fields(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            m_win = data.get("max_replies_per_window")
+            m_contact = data.get("max_replies_per_contact_window")
+            if m_contact is None and m_win is not None:
+                data["max_replies_per_contact_window"] = m_win
+            elif m_contact is not None and m_win is None:
+                data["max_replies_per_window"] = m_contact
+            elif m_contact is not None and m_win is not None:
+                data["max_replies_per_contact_window"] = m_contact
+                data["max_replies_per_window"] = m_contact
+        return data
+
+    @model_validator(mode="after")
+    def sync_update_fields_after(self) -> "ChatbotConfigUpdateRequest":
+        if self.max_replies_per_contact_window is not None:
+            self.max_replies_per_window = self.max_replies_per_contact_window
+        elif self.max_replies_per_window is not None:
+            self.max_replies_per_contact_window = self.max_replies_per_window
+        return self
 
 
 class ChatbotAddContactRequest(BaseModel):

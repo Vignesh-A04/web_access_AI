@@ -1168,6 +1168,22 @@ class WhatsAppChatbotService:
                 self._log_processing_summary(message_id, contact_name, ChatbotMessageStatusEnum.SKIPPED.value, total_ms, stage_timings)
                 return
 
+            # Pre-send rate limit verification under browser send lock
+            recent_count = chatbot_store.count_recent_replies(contact_name, config.rate_limit_window_minutes)
+            if recent_count >= config.max_replies_per_contact_window:
+                total_ms = round((time.perf_counter() - t_detect_start) * 1000.0, 2)
+                reason = f"Rate limit reached before sending ({recent_count}/{config.max_replies_per_contact_window} in {config.rate_limit_window_minutes}m)."
+                chatbot_store.update_message_status(
+                    message_id,
+                    ChatbotMessageStatusEnum.SKIPPED,
+                    skip_reason=reason,
+                    total_duration_ms=total_ms,
+                    stage_timings=stage_timings,
+                )
+                self._log_event("message_skipped", f"Send aborted for {message_id}: rate limit reached", message_id=message_id, reason="rate_limit_exceeded")
+                self._log_processing_summary(message_id, contact_name, ChatbotMessageStatusEnum.SKIPPED.value, total_ms, stage_timings)
+                return
+
             # Transition to SENDING
             chatbot_store.update_message_status(message_id, ChatbotMessageStatusEnum.SENDING)
             self._log_stage_timing(
@@ -1304,6 +1320,18 @@ class WhatsAppChatbotService:
 
                 if not header_name or header_name.strip().lower() != contact_name.lower():
                     abort_reason = f"Active conversation '{header_name}' does not match recipient '{contact_name}'. Send aborted for safety."
+                    logger.warning(abort_reason)
+                    chatbot_store.update_message_status(
+                        message_id,
+                        ChatbotMessageStatusEnum.READY_TO_SEND,
+                        skip_reason=abort_reason
+                    )
+                    return chatbot_store.get_message_by_id(message_id)
+
+                # Revalidate rate limit under browser send lock
+                recent_count = chatbot_store.count_recent_replies(contact_name, config.rate_limit_window_minutes)
+                if recent_count >= config.max_replies_per_contact_window:
+                    abort_reason = f"Rate limit reached ({recent_count}/{config.max_replies_per_contact_window} in {config.rate_limit_window_minutes}m). Approved send aborted."
                     logger.warning(abort_reason)
                     chatbot_store.update_message_status(
                         message_id,

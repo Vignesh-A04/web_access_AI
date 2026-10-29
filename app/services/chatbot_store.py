@@ -162,14 +162,14 @@ class ChatbotStore:
             cur1 = conn.execute("""
                 UPDATE processed_messages
                 SET status = 'FAILED',
-                    skip_reason = 'Interrupted: application restarted while generating reply.',
+                    skip_reason = 'Recovered on startup: application restarted while generating reply.',
                     updated_at = ?
                 WHERE status = 'GENERATING'
             """, (now_iso,))
             cur2 = conn.execute("""
                 UPDATE processed_messages
                 SET status = 'SEND_UNCONFIRMED',
-                    skip_reason = 'Interrupted: application restarted while sending reply. Reconcile manually.',
+                    skip_reason = 'Recovered on startup: application restarted while sending reply. Reconcile manually.',
                     updated_at = ?
                 WHERE status = 'SENDING'
             """, (now_iso,))
