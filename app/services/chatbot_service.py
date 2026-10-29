@@ -1397,6 +1397,20 @@ class WhatsAppChatbotService:
 
                 return chatbot_store.get_message_by_id(message_id)
 
+    async def reset_contact_rate_limit(self, contact_name: str) -> Optional[str]:
+        """Reset sent-reply rate-limit history for a specific contact with concurrency protection."""
+        contact_lock = self._get_contact_lock(contact_name)
+        async with contact_lock:
+            reset_at = chatbot_store.reset_contact_rate_limit(contact_name)
+            if reset_at:
+                self._log_event(
+                    "rate_limit_reset",
+                    f"Rate limit reset for contact '{contact_name}'.",
+                    contact_name=contact_name,
+                    reset_at=reset_at
+                )
+            return reset_at
+
 
 # Global singleton chatbot service
 chatbot_service = WhatsAppChatbotService()

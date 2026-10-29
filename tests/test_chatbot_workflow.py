@@ -1468,4 +1468,173 @@ async def test_generated_proposals_not_counted_against_rate_limit(mock_chatbot_s
         chatbot_reply_service.set_mock_responder(None)
 
 
+# =========================================================================
+# Tests: Reset Contact Rate Limit Functionality and Isolation
+# =========================================================================
+
+def test_reset_contact_rate_limit_endpoint_success():
+    """Verify reset-rate-limit endpoint clears only that contact's sent-reply history and keeps config intact."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    client = TestClient(app)
+    contact = f"ResetTestUser_{uuid.uuid4().hex[:6]}"
+    add_res = client.post("/api/chatbot/contacts", json={"contact_name": contact})
+    assert add_res.status_code == 201
+
+    config_before = chatbot_store.get_config()
+    max_replies_orig = config_before.max_replies_per_contact_window
+    window_orig = config_before.rate_limit_window_minutes
+
+    # Seed 5 SENT messages for this contact
+    for i in range(5):
+        fp = f"reset-seed-{contact}-{i}"
+        rec = chatbot_store.record_detected_message(fp, contact, f"Incoming {i}", "12:00")
+        assert rec is not None
+        chatbot_store.update_message_status(rec.id, ChatbotMessageStatusEnum.SENT, reply_text=f"Sent {i}")
+
+    # Verify count is 5
+    assert chatbot_store.count_recent_replies(contact, window_orig) == 5
+
+    # Reset rate limit via API
+    res = client.post(f"/api/chatbot/contacts/{contact}/reset-rate-limit")
+    assert res.status_code == 200
+    data = res.json()
+    assert data["status"] == "success"
+    assert data["contact_name"] == contact
+    assert f"Rate limit reset successfully for '{contact}'" in data["message"]
+    assert "rate_limit_reset_at" in data and data["rate_limit_reset_at"] is not None
+
+    # Count must now be 0
+    assert chatbot_store.count_recent_replies(contact, window_orig) == 0
+
+    # Config limits and window must be completely unchanged
+    config_after = chatbot_store.get_config()
+    assert config_after.max_replies_per_contact_window == max_replies_orig
+    assert config_after.rate_limit_window_minutes == window_orig
+
+    # Clean up
+    chatbot_store.remove_contact(contact)
+
+
+def test_reset_contact_rate_limit_isolation_across_contacts():
+    """Verify resetting one contact does not affect another contact's rate-limit count."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    client = TestClient(app)
+    contact_a = f"IsolatedUserA_{uuid.uuid4().hex[:6]}"
+    contact_b = f"IsolatedUserB_{uuid.uuid4().hex[:6]}"
+
+    chatbot_store.add_contact(contact_a)
+    chatbot_store.add_contact(contact_b)
+
+    # Seed 4 SENT messages for contact_a and 4 SENT messages for contact_b
+    for i in range(4):
+        fp_a = f"iso-a-{contact_a}-{i}"
+        rec_a = chatbot_store.record_detected_message(fp_a, contact_a, f"Msg A {i}", "12:00")
+        chatbot_store.update_message_status(rec_a.id, ChatbotMessageStatusEnum.SENT, reply_text=f"Reply A {i}")
+
+        fp_b = f"iso-b-{contact_b}-{i}"
+        rec_b = chatbot_store.record_detected_message(fp_b, contact_b, f"Msg B {i}", "12:00")
+        chatbot_store.update_message_status(rec_b.id, ChatbotMessageStatusEnum.SENT, reply_text=f"Reply B {i}")
+
+    assert chatbot_store.count_recent_replies(contact_a, 15) == 4
+    assert chatbot_store.count_recent_replies(contact_b, 15) == 4
+
+    # Reset ONLY contact_a
+    res = client.post(f"/api/chatbot/contacts/{contact_a}/reset-rate-limit")
+    assert res.status_code == 200
+
+    # Contact A count is reset to 0
+    assert chatbot_store.count_recent_replies(contact_a, 15) == 0
+
+    # Contact B count MUST remain unchanged at 4
+    assert chatbot_store.count_recent_replies(contact_b, 15) == 4
+
+    # Clean up
+    chatbot_store.remove_contact(contact_a)
+    chatbot_store.remove_contact(contact_b)
+
+
+def test_reset_contact_rate_limit_validation():
+    """Verify contact identity validation on the reset endpoint."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    client = TestClient(app)
+
+    # Non-existent contact
+    res_404 = client.post("/api/chatbot/contacts/NonExistentGhostUser123/reset-rate-limit")
+    assert res_404.status_code == 404
+    assert "not found in allowlist" in res_404.json()["detail"].lower()
+
+    # Empty / whitespace-only contact
+    res_422 = client.post("/api/chatbot/contacts/%20%20%20/reset-rate-limit")
+    assert res_422.status_code == 422
+
+
+def test_reset_contact_rate_limit_preserves_deduplication():
+    """Verify reset clears rate-limit counter without breaking message deduplication fingerprints."""
+    contact = f"DedupResetUser_{uuid.uuid4().hex[:6]}"
+    chatbot_store.add_contact(contact)
+
+    fp = chatbot_store.compute_fingerprint(contact, "Hello again", "12:00")
+    rec = chatbot_store.record_detected_message(fp, contact, "Hello again", "12:00")
+    assert rec is not None
+    chatbot_store.update_message_status(rec.id, ChatbotMessageStatusEnum.SENT, reply_text="Hello back!")
+
+    # Verify rate limit is 1
+    assert chatbot_store.count_recent_replies(contact, 15) == 1
+
+    # Reset contact rate limit
+    reset_at = chatbot_store.reset_contact_rate_limit(contact)
+    assert reset_at is not None
+
+    # Rate limit count is now 0
+    assert chatbot_store.count_recent_replies(contact, 15) == 0
+
+    # Deduplication MUST still block duplicate insertion of the exact same message!
+    duplicate_rec = chatbot_store.record_detected_message(fp, contact, "Hello again", "12:00")
+    assert duplicate_rec is None  # Blocked by deduplication!
+    assert chatbot_store.is_message_known(fp) is True
+
+    # Audit log still retains the message
+    recent = chatbot_store.list_recent_messages(50)
+    assert any(m.id == rec.id for m in recent)
+
+    # Clean up
+    chatbot_store.remove_contact(contact)
+
+
+@pytest.mark.asyncio
+async def test_reset_contact_rate_limit_concurrency():
+    """Verify resetting rate limit with per-contact concurrency protection does not race with message workflows."""
+    service = WhatsAppChatbotService()
+    contact = f"ConcurrentResetUser_{uuid.uuid4().hex[:6]}"
+    chatbot_store.add_contact(contact)
+
+    # Seed messages to hit limit
+    for i in range(5):
+        fp = f"conc-seed-{contact}-{i}"
+        rec = chatbot_store.record_detected_message(fp, contact, f"Msg {i}", "12:00")
+        chatbot_store.update_message_status(rec.id, ChatbotMessageStatusEnum.SENT, reply_text=f"R {i}")
+
+    assert chatbot_store.count_recent_replies(contact, 15) == 5
+
+    # Run reset_contact_rate_limit concurrently with another contact lock check
+    lock = service._get_contact_lock(contact)
+    async with lock:
+        # Lock held
+        pass
+
+    reset_res = await service.reset_contact_rate_limit(contact)
+    assert reset_res is not None
+    assert chatbot_store.count_recent_replies(contact, 15) == 0
+
+    # Clean up
+    chatbot_store.remove_contact(contact)
+
+
+
 

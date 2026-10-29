@@ -14,6 +14,7 @@ from app.api.schemas import (
     ChatbotConfigUpdateRequest,
     ChatbotMessageRecord,
     ChatbotReconcileRequest,
+    ChatbotResetRateLimitResponse,
     ChatbotStatusResponse,
     HealthResponse,
     TaskCreateRequest,
@@ -282,6 +283,44 @@ async def resume_chatbot_contact(contact_name: str):
     if not success:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Contact '{contact_name}' not found")
     return chatbot_store.get_config()
+
+
+@api_router.post(
+    "/api/chatbot/contacts/{contact_name}/reset-rate-limit",
+    response_model=ChatbotResetRateLimitResponse,
+    tags=["Chatbot"]
+)
+async def reset_chatbot_contact_rate_limit(contact_name: str):
+    """Reset the sent-reply rate-limit history for a specific allowlisted contact."""
+    clean_name = contact_name.strip()
+    if not clean_name:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Contact name cannot be empty or whitespace only.",
+        )
+
+    contact_entry = chatbot_store.get_contact(clean_name)
+    if not contact_entry:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Contact '{clean_name}' not found in allowlist.",
+        )
+
+    canonical_name = contact_entry.contact_name
+    reset_at = await chatbot_service.reset_contact_rate_limit(canonical_name)
+    if not reset_at:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to reset rate limit for '{canonical_name}'.",
+        )
+
+    return ChatbotResetRateLimitResponse(
+        status="success",
+        contact_name=canonical_name,
+        message=f"Rate limit reset successfully for '{canonical_name}'.",
+        rate_limit_reset_at=reset_at,
+    )
+
 
 
 @api_router.get("/api/chatbot/messages", response_model=List[ChatbotMessageRecord], tags=["Chatbot"])

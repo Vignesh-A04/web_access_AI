@@ -54,9 +54,14 @@ class ChatbotStore:
                     contact_name TEXT PRIMARY KEY,
                     is_paused INTEGER NOT NULL DEFAULT 0,
                     added_at TEXT NOT NULL,
-                    notes TEXT
+                    notes TEXT,
+                    rate_limit_reset_at TEXT
                 )
             """)
+            try:
+                conn.execute("ALTER TABLE contact_allowlist ADD COLUMN rate_limit_reset_at TEXT")
+            except sqlite3.OperationalError:
+                pass
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS processed_messages (
                     id TEXT PRIMARY KEY,
@@ -183,13 +188,14 @@ class ChatbotStore:
     def list_contacts(self) -> List[ChatbotContactItem]:
         """List all allowlisted contacts."""
         with self._lock, self._get_connection() as conn:
-            rows = conn.execute("SELECT contact_name, is_paused, added_at, notes FROM contact_allowlist ORDER BY contact_name ASC").fetchall()
+            rows = conn.execute("SELECT contact_name, is_paused, added_at, notes, rate_limit_reset_at FROM contact_allowlist ORDER BY contact_name ASC").fetchall()
             return [
                 ChatbotContactItem(
                     contact_name=r["contact_name"],
                     is_paused=bool(r["is_paused"]),
                     added_at=r["added_at"],
-                    notes=r["notes"]
+                    notes=r["notes"],
+                    rate_limit_reset_at=r["rate_limit_reset_at"] if "rate_limit_reset_at" in r.keys() else None
                 )
                 for r in rows
             ]
@@ -243,14 +249,29 @@ class ChatbotStore:
         """Get contact entry by name."""
         normalized = contact_name.strip()
         with self._lock, self._get_connection() as conn:
-            row = conn.execute("SELECT contact_name, is_paused, added_at, notes FROM contact_allowlist WHERE LOWER(contact_name) = LOWER(?)", (normalized,)).fetchone()
+            row = conn.execute("SELECT contact_name, is_paused, added_at, notes, rate_limit_reset_at FROM contact_allowlist WHERE LOWER(contact_name) = LOWER(?)", (normalized,)).fetchone()
             if row:
                 return ChatbotContactItem(
                     contact_name=row["contact_name"],
                     is_paused=bool(row["is_paused"]),
                     added_at=row["added_at"],
-                    notes=row["notes"]
+                    notes=row["notes"],
+                    rate_limit_reset_at=row["rate_limit_reset_at"] if "rate_limit_reset_at" in row.keys() else None
                 )
+            return None
+
+    def reset_contact_rate_limit(self, contact_name: str) -> Optional[str]:
+        """Reset sent-reply rate-limit history for a specific contact by setting rate_limit_reset_at to now."""
+        normalized = contact_name.strip()
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self._lock, self._get_connection() as conn:
+            cursor = conn.execute(
+                "UPDATE contact_allowlist SET rate_limit_reset_at = ? WHERE LOWER(contact_name) = LOWER(?)",
+                (now_iso, normalized)
+            )
+            conn.commit()
+            if cursor.rowcount > 0:
+                return now_iso
             return None
 
     def is_contact_allowed(self, contact_name: str) -> bool:
@@ -416,15 +437,34 @@ class ChatbotStore:
             return cursor.rowcount > 0
 
     def count_recent_replies(self, contact_name: str, window_minutes: int) -> int:
-        """Count how many automated replies were sent (or sending) to this contact within window."""
-        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=window_minutes)).isoformat()
+        """Count how many automated replies were sent (or sending) to this contact within window, respecting any reset."""
+        cutoff_dt = datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
         with self._lock, self._get_connection() as conn:
-            row = conn.execute("""
+            contact_row = conn.execute(
+                "SELECT rate_limit_reset_at FROM contact_allowlist WHERE LOWER(contact_name) = LOWER(?)",
+                (contact_name.strip(),)
+            ).fetchone()
+
+            effective_cutoff_dt = cutoff_dt
+            is_reset_cutoff = False
+            if contact_row and "rate_limit_reset_at" in contact_row.keys() and contact_row["rate_limit_reset_at"]:
+                try:
+                    reset_dt = datetime.fromisoformat(contact_row["rate_limit_reset_at"])
+                    if reset_dt > effective_cutoff_dt:
+                        effective_cutoff_dt = reset_dt
+                        is_reset_cutoff = True
+                except Exception:
+                    pass
+
+            effective_cutoff_iso = effective_cutoff_dt.isoformat()
+            op = ">" if is_reset_cutoff else ">="
+            query = f"""
                 SELECT COUNT(*) as count FROM processed_messages
                 WHERE LOWER(contact_name) = LOWER(?)
                   AND status IN ('SENT', 'SENDING')
-                  AND created_at >= ?
-            """, (contact_name.strip(), cutoff)).fetchone()
+                  AND created_at {op} ?
+            """
+            row = conn.execute(query, (contact_name.strip(), effective_cutoff_iso)).fetchone()
             return row["count"] if row else 0
 
     def list_recent_messages(self, limit: int = 50) -> List[ChatbotMessageRecord]:

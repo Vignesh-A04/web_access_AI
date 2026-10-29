@@ -190,6 +190,7 @@ class ChatbotContactItem(BaseModel):
     is_paused: bool = False
     added_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     notes: Optional[str] = None
+    rate_limit_reset_at: Optional[str] = None
 
     @model_validator(mode="after")
     def sync_name(self) -> "ChatbotContactItem":
@@ -337,6 +338,15 @@ class ChatbotReconcileRequest(BaseModel):
     """Payload to resolve an uncertain send outcome."""
     confirm_sent: bool = Field(..., description="True if manual inspection confirmed message sent, False to mark skipped")
     notes: Optional[str] = None
+
+
+class ChatbotResetRateLimitResponse(BaseModel):
+    """Response returned after resetting a contact's sent-reply rate limit."""
+    status: str = "success"
+    contact_name: str
+    message: str
+    rate_limit_reset_at: str
+
 
 
 
