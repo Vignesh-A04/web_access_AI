@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ai_web_agent_backend
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-3.5-flash-lite}
+      - BACKEND_HOST=0.0.0.0
+
+      - BACKEND_PORT=8000
+      - BROWSER_HEADLESS=true
+      - ALLOW_LOCAL_TEST_DOMAINS=true
+      - FRONTEND_ORIGIN=http://localhost:5173
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    volumes:
+      - task_artifacts:/app/task_artifacts
+
+volumes:
+  task_artifacts:
