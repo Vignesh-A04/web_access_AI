@@ -7,10 +7,12 @@ import urllib.parse
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+import httpx
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright, Playwright
 
 from app.api.schemas import (
     WhatsAppCandidateItem,
+    WhatsAppSendModeEnum,
     WhatsAppStateEnum,
     WhatsAppTaskRequest,
     WhatsAppTaskResponse,
@@ -31,6 +33,63 @@ class WhatsAppVerificationError(WhatsAppAutomationError):
     pass
 
 
+async def check_cdp_preflight(cdp_url: str, timeout_seconds: float = 3.0) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+    """Safety preflight check verifying that Chrome DevTools Protocol endpoint is reachable.
+
+    1. Validates that the CDP endpoint is strictly bound to 127.0.0.1 loopback.
+    2. Probes http://127.0.0.1:{port}/json/version via HTTP before Playwright connects.
+    3. If unavailable, returns exact Windows PowerShell instructions to launch Chrome.
+    """
+    try:
+        parsed = urllib.parse.urlparse(cdp_url)
+        hostname = (parsed.hostname or "").lower()
+
+        # Security policy: bind remote debugging strictly to 127.0.0.1 loopback
+        if hostname not in {"127.0.0.1", "localhost"}:
+            return False, (
+                f"Security policy rejection: Chrome CDP endpoint must be bound to 127.0.0.1 loopback. "
+                f"Attempting to attach to remote host '{hostname}' is prohibited to prevent remote browser hijacking."
+            ), None
+
+        port = parsed.port or 9222
+        version_url = f"http://127.0.0.1:{port}/json/version"
+
+        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+            resp = await client.get(version_url)
+            if resp.status_code == 200:
+                data = resp.json()
+                browser_ver = data.get("Browser", "Chrome")
+                return True, f"CDP endpoint reachable on 127.0.0.1:{port} ({browser_ver})", data
+            return False, f"CDP endpoint at 127.0.0.1:{port} returned unexpected HTTP {resp.status_code}.", None
+    except (httpx.ConnectError, httpx.NetworkError):
+        port_num = parsed.port if 'parsed' in locals() and parsed and parsed.port else 9222
+        return False, (
+            f"Chrome DevTools Protocol (CDP) endpoint is not listening at 127.0.0.1:{port_num} (Connection Refused).\n\n"
+            f"Root cause: Google Chrome is not currently running with remote debugging enabled on port {port_num}.\n\n"
+            f"How to start your dedicated Chrome profile (run in Windows PowerShell):\n"
+            f'& "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --remote-debugging-port={port_num} --user-data-dir="C:\\ChromeWhatsAppProfile"\n\n'
+            f"Next steps:\n"
+            f"1. Open https://web.whatsapp.com in that dedicated Chrome window.\n"
+            f"2. Ensure you are logged into WhatsApp Web.\n"
+            f"3. Keep the Chrome window open and retry this workflow."
+        ), None
+    except httpx.TimeoutException:
+        port_num = parsed.port if 'parsed' in locals() and parsed and parsed.port else 9222
+        return False, (
+            f"Chrome DevTools Protocol (CDP) endpoint timed out at 127.0.0.1:{port_num} after {timeout_seconds}s.\n\n"
+            f"Root cause: Google Chrome is not currently running or responding with remote debugging enabled on port {port_num}.\n\n"
+            f"How to start your dedicated Chrome profile (run in Windows PowerShell):\n"
+            f'& "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --remote-debugging-port={port_num} --user-data-dir="C:\\ChromeWhatsAppProfile"\n\n'
+            f"Next steps:\n"
+            f"1. Open https://web.whatsapp.com in that dedicated Chrome window.\n"
+            f"2. Ensure you are logged into WhatsApp Web.\n"
+            f"3. Keep the Chrome window open and retry this workflow."
+        ), None
+    except Exception as e:
+        return False, f"CDP preflight check failed with error: {e}", None
+
+
+
 class WhatsAppWorkflowTask:
     """Manages the full lifecycle of an autonomous WhatsApp message task."""
 
@@ -38,6 +97,7 @@ class WhatsAppWorkflowTask:
         self.task_id = task_id
         self.contact_name = request.contact_name.strip()
         self.message_text = request.message
+        self.send_mode: WhatsAppSendModeEnum = request.send_mode or WhatsAppSendModeEnum.MANUAL
         self.cdp_url = request.cdp_url or settings.chrome_cdp_url
         self.target_url = request.target_url or "https://web.whatsapp.com"
         self.status = WhatsAppStateEnum.QUEUED
@@ -106,6 +166,7 @@ class WhatsAppWorkflowTask:
         return WhatsAppTaskResponse(
             task_id=self.task_id,
             status=self.status,
+            send_mode=self.send_mode,
             contact_name=self.contact_name,
             selected_contact=self.selected_contact,
             candidates=self.candidates,
@@ -189,11 +250,28 @@ class WhatsAppAutomationService:
         timeout = settings.whatsapp_timeout_seconds
 
         try:
+            # Operational mode distinction
+            is_mock_mode = "test-whatsapp" in task.target_url or "test-site" in task.target_url
+            if is_mock_mode:
+                task.add_log(f"[ISOLATED LOCAL TEST MOCK MODE] Target URL: {task.target_url}")
+            else:
+                task.add_log(f"[LIVE WHATSAPP WEB MODE] Target URL: {task.target_url}")
+
             task.add_log(f"Starting WhatsApp workflow for contact: '{task.contact_name}'")
             task.set_status(WhatsAppStateEnum.CONNECTING_CDP)
 
-            # 1. Connect to Chrome via CDP
-            task.add_log(f"Connecting to Chrome via CDP endpoint: {task.cdp_url}")
+            # 1. Preflight Probe: Verify CDP endpoint is reachable before attaching
+            task.add_log(f"Preflight: probing Chrome CDP endpoint at {task.cdp_url} ...")
+            cdp_ok, preflight_msg, _ = await check_cdp_preflight(task.cdp_url, timeout_seconds=3.0)
+            if not cdp_ok:
+                task.add_log(f"CDP Preflight Failed: {preflight_msg}")
+                task.set_status(WhatsAppStateEnum.FAILED, error=preflight_msg)
+                return
+
+            task.add_log(f"CDP Preflight Verified: {preflight_msg}")
+
+            # 2. Attach Playwright to Chrome via CDP
+            task.add_log(f"Attaching Playwright to dedicated Chrome session: {task.cdp_url}")
             task._playwright = await async_playwright().start()
 
             try:
@@ -203,8 +281,8 @@ class WhatsAppAutomationService:
                 )
             except Exception as e:
                 err_msg = (
-                    f"Could not connect to Chrome CDP endpoint ({task.cdp_url}). "
-                    f"Make sure Chrome is running with '--remote-debugging-port=9222': {e}"
+                    f"Could not connect to Chrome CDP endpoint ({task.cdp_url}): {e}\n"
+                    f"Make sure Chrome is running with '--remote-debugging-port=9222'."
                 )
                 task.add_log(err_msg)
                 task.set_status(WhatsAppStateEnum.FAILED, error=err_msg)
@@ -217,11 +295,12 @@ class WhatsAppAutomationService:
 
             context = task._browser.contexts[0]
 
-            # 2. Find or open WhatsApp Web tab
+            # 3. Find or open WhatsApp Web tab
             task.set_status(WhatsAppStateEnum.CHECKING_LOGIN)
             page = await self._find_or_open_whatsapp_page(context, task.target_url, timeout)
             task._page = page
             await task.capture_screenshot("connected")
+
 
             # Check if logged in
             task.add_log("Verifying WhatsApp Web login session...")
@@ -331,27 +410,34 @@ class WhatsAppAutomationService:
                 "char_count": len(task.message_text),
             }
 
-            # 6. Require explicit user Send confirmation
-            task.set_status(WhatsAppStateEnum.WAITING_FOR_SEND_APPROVAL)
-            task.add_log(f"Message drafted. Waiting for explicit user confirmation to send to '{displayed_header}'.")
+            # 6. Dispatch based on explicit send mode
+            if task.send_mode == WhatsAppSendModeEnum.AUTOMATIC:
+                task.add_log(
+                    f"[AUTOMATIC SEND MODE] Explicitly selected for this task. "
+                    f"Recipient '{displayed_header}' verified. Proceeding to send automatically..."
+                )
+            else:
+                # Manual approval mode (default)
+                task.set_status(WhatsAppStateEnum.WAITING_FOR_SEND_APPROVAL)
+                task.add_log(f"Message drafted. Waiting for explicit user confirmation before sending to '{displayed_header}'.")
 
-            task._send_approval_event.clear()
-            await task._send_approval_event.wait()
+                task._send_approval_event.clear()
+                await task._send_approval_event.wait()
 
-            if task._cancel_requested or task._send_approved is False:
-                task.add_log(f"Send cancelled by user: {task._approval_reason or 'No reason provided'}")
-                # Clear composer to leave chat clean
-                await self._clear_composer(page)
-                task.set_status(WhatsAppStateEnum.CANCELLED)
-                return
+                if task._cancel_requested or task._send_approved is False:
+                    task.add_log(f"Send cancelled by user: {task._approval_reason or 'No reason provided'}")
+                    # Clear composer to leave chat clean
+                    await self._clear_composer(page)
+                    task.set_status(WhatsAppStateEnum.CANCELLED)
+                    return
 
-            if task._send_approved is not True:
-                task.set_status(WhatsAppStateEnum.CANCELLED)
-                return
+                if task._send_approved is not True:
+                    task.set_status(WhatsAppStateEnum.CANCELLED)
+                    return
 
-            # 7. Explicit Send button click (ONCE)
+            # 7. Click Send button once
             task.set_status(WhatsAppStateEnum.SENDING)
-            task.add_log("User confirmed. Clicking Send button once...")
+            task.add_log("Clicking Send button once...")
             await self._click_send_button_once(page, timeout=10)
 
             # 8. Sent message verification in conversation
@@ -362,7 +448,10 @@ class WhatsAppAutomationService:
             await task.capture_screenshot("final_result")
 
             if not verified:
-                err_msg = f"Message send could not be verified in conversation: {verify_msg}"
+                err_msg = (
+                    f"Message send could not be verified in conversation: {verify_msg}. "
+                    f"Action stopped; will not automatically resend."
+                )
                 task.add_log(err_msg)
                 task.set_status(WhatsAppStateEnum.FAILED, error=err_msg)
                 return
@@ -376,7 +465,7 @@ class WhatsAppAutomationService:
             task.set_status(WhatsAppStateEnum.FAILED, error=str(e))
             task.add_log(f"Workflow error: {e}")
         finally:
-            # Clean up CDP browser connection safely
+            # Clean up CDP client connection safely without closing the user's remote Chrome
             if task._browser:
                 try:
                     await task._browser.close()
@@ -387,22 +476,28 @@ class WhatsAppAutomationService:
                     await task._playwright.stop()
                 except Exception:
                     pass
-            task.add_log("Cleaned up CDP connection resources.")
+            task.add_log("Cleaned up CDP connection resources. Dedicated Chrome remains open.")
 
     # =========================================================================
     # Browser DOM Interaction & Inspection Helpers
     # =========================================================================
 
     async def _find_or_open_whatsapp_page(self, context: BrowserContext, target_url: str, timeout_seconds: int) -> Page:
-        """Find an existing WhatsApp Web tab or create and navigate a new page."""
+        """Find an existing WhatsApp Web tab or create and navigate a new page without destroying existing context."""
         parsed_target = urllib.parse.urlparse(target_url)
-        target_domain = parsed_target.netloc or "web.whatsapp.com"
+        target_domain = (parsed_target.netloc or "web.whatsapp.com").lower()
 
-        # Check existing tabs
+        # Check existing tabs first to reuse the user's active session
         for p in context.pages:
             try:
-                curr_url = p.url
-                if target_domain in curr_url or target_url in curr_url:
+                curr_url = p.url.lower()
+                title = ""
+                try:
+                    title = (await p.title()).lower()
+                except Exception:
+                    pass
+
+                if target_domain in curr_url or target_url.lower() in curr_url or ("web.whatsapp.com" in target_url and "whatsapp" in title):
                     await p.bring_to_front()
                     return p
             except Exception:
@@ -470,6 +565,9 @@ class WhatsAppAutomationService:
     async def _search_contacts(self, page: Page, contact_name: str, timeout: int = 10) -> List[WhatsAppCandidateItem]:
         """Type contact name in WhatsApp Web search bar and collect candidate results."""
         search_selectors = [
+            "#side input[aria-label*='Search']",
+            "#side input",
+            "#side [role='textbox']",
             "#side div[contenteditable='true'][data-tab='3']",
             "#side div[role='textbox']",
             "div[contenteditable='true'][data-tab='3']",
@@ -489,36 +587,38 @@ class WhatsAppAutomationService:
             raise WhatsAppAutomationError("Could not locate WhatsApp chat search input field.")
 
         await search_input.click()
-        # Clear existing text
-        await page.keyboard.press("Control+A")
-        await page.keyboard.press("Backspace")
-        await asyncio.sleep(0.2)
+        tag = await search_input.evaluate("el => el.tagName.toLowerCase()")
+        if tag == "input":
+            await search_input.fill("")
+            await page.keyboard.type(contact_name, delay=20)
+        else:
+            await page.keyboard.press("Control+A")
+            await page.keyboard.press("Backspace")
+            await asyncio.sleep(0.2)
+            await page.keyboard.insert_text(contact_name)
 
-        # Type contact query
-        await page.keyboard.insert_text(contact_name)
         await asyncio.sleep(1.5)  # Allow search indexing and rendering
 
         # Extract contact results from DOM
         candidates_data = await page.evaluate("""
             (searchQuery) => {
                 const results = [];
-                // Look for chat item elements inside #side or chat-list
+                const filterTabs = new Set(['all', 'unread', 'favourites', 'groups', 'communities', 'chats']);
                 const listItems = document.querySelectorAll(
                     '#side div[data-testid="cell-frame-container"], #side div[role="listitem"], [data-testid="chat-list"] > div, .chat-item, .contact-item'
                 );
 
                 listItems.forEach((el, index) => {
-                    // Extract title/name
                     const titleEl = el.querySelector(
                         'span[data-testid="cell-frame-title"] span, span[dir="auto"], span[title], .chat-title, .contact-name'
                     );
                     const name = titleEl ? (titleEl.getAttribute('title') || titleEl.innerText || '').trim() : '';
+                    if (!name || filterTabs.has(name.toLowerCase())) return;
 
-                    // Extract preview/subtitle
                     const subEl = el.querySelector('span[data-testid="last-msg-status"], .last-msg, .chat-subtitle');
                     const subtitle = subEl ? (subEl.innerText || '').trim() : '';
 
-                    if (name && name.toLowerCase().includes(searchQuery.toLowerCase())) {
+                    if (name.toLowerCase().includes(searchQuery.toLowerCase())) {
                         results.push({
                             id: 'candidate-' + (index + 1),
                             name: name,
@@ -548,9 +648,18 @@ class WhatsAppAutomationService:
 
     async def _click_contact_item(self, page: Page, contact_name: str, timeout: int = 10) -> None:
         """Click on the contact in the search results list."""
-        contact_loc = page.locator(f"#side span[title='{contact_name}'], #side span:has-text('{contact_name}'), .contact-item:has-text('{contact_name}')").first
+        active_header = await self._get_active_chat_header_name(page, timeout=1)
+        if active_header and active_header.strip().lower() == contact_name.strip().lower():
+            # Already active chat window
+            return
+
+        contact_loc = page.locator(
+            f"#side span[title='{contact_name}'], "
+            f"#side div[data-testid='cell-frame-container']:has-text('{contact_name}'), "
+            f"#side span:has-text('{contact_name}'), "
+            f".contact-item:has-text('{contact_name}')"
+        ).first
         if await contact_loc.count() == 0:
-            # Fallback to broader selector
             contact_loc = page.locator(f"span[title='{contact_name}']").first
 
         if await contact_loc.count() == 0:
@@ -591,8 +700,11 @@ class WhatsAppAutomationService:
             "#main footer div[role='textbox']",
             "div[data-testid='conversation-compose-box-input']",
             "#main footer div[contenteditable='true']",
+            "div[contenteditable='true'][aria-label*='Type a message']",
+            "div[contenteditable='true']",
             "#message-composer",
         ]
+
 
         composer = None
         for sel in composer_selectors:

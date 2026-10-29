@@ -9,16 +9,26 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from app.api.schemas import (
     ActionLogItem,
     ApproveActionRequest,
+    ChatbotAddContactRequest,
+    ChatbotConfigModel,
+    ChatbotConfigUpdateRequest,
+    ChatbotMessageRecord,
+    ChatbotReconcileRequest,
+    ChatbotStatusResponse,
     HealthResponse,
     TaskCreateRequest,
     TaskResponse,
     WhatsAppCandidateItem,
     WhatsAppSelectContactRequest,
     WhatsAppSendConfirmationRequest,
+    WhatsAppStateEnum,
     WhatsAppTaskRequest,
     WhatsAppTaskResponse,
 )
 from app.config import settings
+from app.services.chatbot_reply_service import chatbot_reply_service
+from app.services.chatbot_service import chatbot_service
+from app.services.chatbot_store import chatbot_store
 from app.services.task_service import task_service
 from app.services.whatsapp_service import whatsapp_service
 
@@ -169,9 +179,138 @@ async def cancel_whatsapp_task(task_id: str):
 async def get_whatsapp_screenshot(task_id: str):
     """Retrieve the latest screenshot captured during WhatsApp automation."""
     task = whatsapp_service.get_task(task_id)
-    if not task or not task.screenshot_path or not Path(task.screenshot_path).exists():
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Screenshot not available")
+    if not task:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"WhatsApp task '{task_id}' not found")
+    if not task.screenshot_path or not Path(task.screenshot_path).exists():
+        if task.status in {WhatsAppStateEnum.FAILED, WhatsAppStateEnum.CANCELLED}:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Screenshot unavailable: task {task.status.value.lower()} before any screenshot was captured."
+            )
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Screenshot pending: task is currently in state '{task.status.value}'."
+        )
     return FileResponse(task.screenshot_path, media_type="image/png")
+
+
+# =========================================================================
+# WhatsApp Incoming Chatbot Endpoints
+# =========================================================================
+
+@api_router.get("/api/chatbot/config", response_model=ChatbotConfigModel, tags=["Chatbot"])
+async def get_chatbot_config():
+    """Retrieve the current chatbot configuration."""
+    return chatbot_store.get_config()
+
+
+@api_router.post("/api/chatbot/config", response_model=ChatbotConfigModel, tags=["Chatbot"])
+async def update_chatbot_config(req: ChatbotConfigUpdateRequest):
+    """Update runtime chatbot configuration (intervals, auto-reply, rate limits, lengths)."""
+    return chatbot_service.update_config(req)
+
+
+@api_router.get("/api/chatbot/status", response_model=ChatbotStatusResponse, tags=["Chatbot"])
+async def get_chatbot_status():
+    """Retrieve the current status of the incoming-message chatbot monitor."""
+    return chatbot_service.get_status()
+
+
+@api_router.post("/api/chatbot/start", response_model=ChatbotStatusResponse, tags=["Chatbot"])
+async def start_chatbot():
+    """Start the background monitor for WhatsApp incoming messages."""
+    await chatbot_service.start()
+    return chatbot_service.get_status()
+
+
+@api_router.post("/api/chatbot/stop", response_model=ChatbotStatusResponse, tags=["Chatbot"])
+async def stop_chatbot():
+    """Stop the background monitor safely and detach from the browser."""
+    await chatbot_service.stop()
+    return chatbot_service.get_status()
+
+
+@api_router.post("/api/chatbot/contacts", response_model=ChatbotConfigModel, status_code=status.HTTP_201_CREATED, tags=["Chatbot"])
+async def add_chatbot_contact(req: ChatbotAddContactRequest):
+    """Add a verified contact name to the explicit allowlist."""
+    name = (req.contact_name or req.name or "").strip()
+    if not name:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Contact name cannot be empty or whitespace only.",
+        )
+
+    existing = chatbot_store.get_contact(name)
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Contact '{existing.contact_name}' is already in the allowlist.",
+        )
+
+    try:
+        chatbot_store.add_contact(name, req.notes)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(e),
+        )
+    return chatbot_store.get_config()
+
+
+@api_router.delete("/api/chatbot/contacts/{contact_name}", response_model=ChatbotConfigModel, tags=["Chatbot"])
+async def remove_chatbot_contact(contact_name: str):
+    """Remove a contact from the allowlist."""
+    success = chatbot_store.remove_contact(contact_name)
+    if not success:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Contact '{contact_name}' not in allowlist")
+    return chatbot_store.get_config()
+
+
+@api_router.post("/api/chatbot/contacts/{contact_name}/pause", response_model=ChatbotConfigModel, tags=["Chatbot"])
+async def pause_chatbot_contact(contact_name: str):
+    """Pause automatic monitoring and replies for a specific contact."""
+    success = chatbot_store.set_contact_paused(contact_name, paused=True)
+    if not success:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Contact '{contact_name}' not found")
+    return chatbot_store.get_config()
+
+
+@api_router.post("/api/chatbot/contacts/{contact_name}/resume", response_model=ChatbotConfigModel, tags=["Chatbot"])
+async def resume_chatbot_contact(contact_name: str):
+    """Resume automatic monitoring and replies for a paused contact."""
+    success = chatbot_store.set_contact_paused(contact_name, paused=False)
+    if not success:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Contact '{contact_name}' not found")
+    return chatbot_store.get_config()
+
+
+@api_router.get("/api/chatbot/messages", response_model=List[ChatbotMessageRecord], tags=["Chatbot"])
+async def list_chatbot_messages(limit: int = 50):
+    """List recently observed incoming messages and their processing lifecycle states."""
+    return chatbot_store.list_recent_messages(limit=min(limit, 100))
+
+
+@api_router.get("/api/chatbot/messages/{message_id}", response_model=ChatbotMessageRecord, tags=["Chatbot"])
+async def get_chatbot_message(message_id: str):
+    """Retrieve detailed lifecycle and audit information for a specific message."""
+    msg = chatbot_store.get_message_by_id(message_id)
+    if not msg:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Message '{message_id}' not found")
+    return msg
+
+
+@api_router.post("/api/chatbot/messages/{message_id}/reconcile", response_model=ChatbotMessageRecord, tags=["Chatbot"])
+async def reconcile_chatbot_message(message_id: str, req: ChatbotReconcileRequest):
+    """Reconcile an unconfirmed send (SEND_UNCONFIRMED) safely without blind resending."""
+    reconciled = chatbot_store.reconcile_unconfirmed_message(
+        message_id=message_id,
+        confirmed=req.confirmed,
+        notes=req.notes
+    )
+    if not reconciled:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Message '{message_id}' not found")
+    return reconciled
+
 
 
 def generate_mock_whatsapp_html(mode: Optional[str] = None) -> str:

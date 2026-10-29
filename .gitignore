@@ -62,3 +62,4 @@ Desktop.ini
 *.sqlite3
 *.db
 chroma_db/
+task_artifacts/

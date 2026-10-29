@@ -9,7 +9,11 @@ from fastapi.testclient import TestClient
 from playwright.async_api import async_playwright
 
 from app.api.routes import generate_mock_whatsapp_html
-from app.api.schemas import WhatsAppStateEnum, WhatsAppTaskRequest
+from app.api.schemas import (
+    WhatsAppSendModeEnum,
+    WhatsAppStateEnum,
+    WhatsAppTaskRequest,
+)
 from app.main import app
 from app.services.whatsapp_service import (
     WhatsAppAutomationError,
@@ -408,3 +412,239 @@ async def test_full_cdp_workflow_unauthenticated_login_screen(mock_whatsapp_serv
 
         finally:
             await cdp_browser.close()
+
+
+# =========================================================================
+# 4. CDP Preflight, Safe Disconnection & Screenshot Endpoint Tests
+# =========================================================================
+
+@pytest.mark.asyncio
+async def test_cdp_preflight_unavailable_endpoint():
+    """Verify check_cdp_preflight fails fast with actionable PowerShell error when CDP is down."""
+    from app.services.whatsapp_service import check_cdp_preflight
+
+    ok, message, version_data = await check_cdp_preflight("http://127.0.0.1:9998", timeout_seconds=0.5)
+    assert ok is False
+    assert version_data is None
+    assert "Chrome DevTools Protocol" in message
+    assert "--remote-debugging-port=" in message
+    assert "chrome.exe" in message
+
+
+@pytest.mark.asyncio
+async def test_cdp_preflight_security_loopback_rejection():
+    """Verify check_cdp_preflight rejects non-loopback hosts for security."""
+    from app.services.whatsapp_service import check_cdp_preflight
+
+    ok_ip, msg_ip, _ = await check_cdp_preflight("http://192.168.1.100:9222", timeout_seconds=0.5)
+    assert ok_ip is False
+    assert "Security policy rejection" in msg_ip
+    assert "127.0.0.1" in msg_ip
+
+    ok_domain, msg_domain, _ = await check_cdp_preflight("http://example.com:9222", timeout_seconds=0.5)
+    assert ok_domain is False
+    assert "Security policy rejection" in msg_domain
+
+
+@pytest.mark.asyncio
+async def test_cdp_preflight_success_on_active_endpoint():
+    """Verify check_cdp_preflight returns True when Chrome CDP is listening."""
+    from app.services.whatsapp_service import check_cdp_preflight
+
+    cdp_port = 9239
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            args=[f"--remote-debugging-port={cdp_port}", "--headless=new"]
+        )
+        try:
+            ok, message, version_data = await check_cdp_preflight(f"http://127.0.0.1:{cdp_port}", timeout_seconds=2.0)
+            assert ok is True
+            assert "CDP endpoint reachable" in message
+            assert version_data is not None
+        finally:
+            await browser.close()
+
+
+@pytest.mark.asyncio
+async def test_screenshot_endpoint_status_responses():
+    """Verify get_whatsapp_screenshot returns clear status explanations instead of silent 404s."""
+    from httpx import ASGITransport, AsyncClient
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        # 1. Nonexistent task
+        missing_resp = await ac.get("/api/whatsapp/tasks/nonexistent-xyz/screenshot")
+        assert missing_resp.status_code == 404
+        assert "not found" in missing_resp.json()["detail"].lower()
+
+        # 2. Create task pointing to unreachable port
+        create_resp = await ac.post(
+            "/api/whatsapp/tasks",
+            json={
+                "contact_name": "Test User",
+                "message": "Hello",
+                "cdp_url": "http://127.0.0.1:9997",
+            },
+        )
+        assert create_resp.status_code in {200, 201}
+        task_id = create_resp.json()["task_id"]
+
+        # Allow background task to fail fast via preflight
+        for _ in range(40):
+            t_data = (await ac.get(f"/api/whatsapp/tasks/{task_id}")).json()
+            if t_data["status"] == "failed":
+                break
+            await asyncio.sleep(0.2)
+
+        screenshot_resp = await ac.get(f"/api/whatsapp/tasks/{task_id}/screenshot")
+        assert screenshot_resp.status_code == 404
+        detail = screenshot_resp.json()["detail"]
+        assert "screenshot unavailable" in detail.lower()
+        assert "failed" in detail.lower()
+
+
+@pytest.mark.asyncio
+async def test_safe_browser_disconnect_preserves_remote_browser():
+    """Verify disconnecting Playwright CDP client does NOT close the user's remote browser session."""
+    cdp_port = 9240
+    async with async_playwright() as p_server:
+        user_browser = await p_server.chromium.launch(
+            args=[f"--remote-debugging-port={cdp_port}", "--headless=new"]
+        )
+        user_page = await user_browser.new_page()
+        await user_page.goto("data:text/html,<h1>User Active Tab</h1>")
+
+        try:
+            async with async_playwright() as p_client:
+                client_browser = await p_client.chromium.connect_over_cdp(f"http://127.0.0.1:{cdp_port}")
+                assert len(client_browser.contexts) >= 1
+                await client_browser.close()
+
+            content = await user_page.content()
+            assert "User Active Tab" in content
+        finally:
+            await user_browser.close()
+
+
+def test_local_test_mode_isolation():
+    """Verify local test mode settings do NOT substitute mock behavior for live WhatsApp workflow."""
+    from app.config import settings
+    from app.services.whatsapp_service import WhatsAppWorkflowTask
+
+    assert hasattr(settings, "allow_local_test_domains")
+    from app.api.schemas import WhatsAppTaskRequest
+    default_req = WhatsAppTaskRequest(contact_name="Alice", message="Hi")
+    task = WhatsAppWorkflowTask("test-mode-id", default_req)
+    assert task.target_url == "https://web.whatsapp.com"
+
+
+# =========================================================================
+# 5. Explicit Send Modes: Manual Approval vs Automatic Sending
+# =========================================================================
+
+def test_whatsapp_send_mode_defaults_to_manual():
+    """Verify send_mode strictly defaults to manual approval and is never implicitly automatic."""
+    req = WhatsAppTaskRequest(contact_name="Alice", message="Hello")
+    assert req.send_mode == WhatsAppSendModeEnum.MANUAL
+
+    client = TestClient(app)
+    resp = client.post(
+        "/api/whatsapp/tasks",
+        json={"contact_name": "Alice", "message": "Hello", "cdp_url": "http://127.0.0.1:9996"},
+    )
+    assert resp.status_code in {200, 201}
+    assert resp.json()["send_mode"] == "manual"
+
+
+@pytest.mark.asyncio
+async def test_full_cdp_workflow_automatic_send_mode(mock_whatsapp_server: str):
+    """Verify automatic send mode dispatches and verifies without stopping at WAITING_FOR_SEND_APPROVAL."""
+    cdp_port = 9241
+    cdp_url = f"http://127.0.0.1:{cdp_port}"
+    target_url = f"{mock_whatsapp_server}/test-whatsapp"
+
+    service = WhatsAppAutomationService()
+
+    async with async_playwright() as p:
+        cdp_browser = await p.chromium.launch(
+            args=[f"--remote-debugging-port={cdp_port}", "--headless=new"]
+        )
+
+        try:
+            req = WhatsAppTaskRequest(
+                contact_name="Alice Smith",
+                message="Automated message via explicit automatic send mode",
+                send_mode=WhatsAppSendModeEnum.AUTOMATIC,
+                cdp_url=cdp_url,
+                target_url=target_url,
+            )
+
+            task = await service.start_task(req)
+            assert task.send_mode == WhatsAppSendModeEnum.AUTOMATIC
+
+            # Wait for task to complete without manual confirmation
+            for _ in range(50):
+                if task.status in {WhatsAppStateEnum.COMPLETED, WhatsAppStateEnum.FAILED}:
+                    break
+                await asyncio.sleep(0.4)
+
+            assert task.status == WhatsAppStateEnum.COMPLETED
+            assert task.error is None
+            assert any("AUTOMATIC SEND MODE" in log for log in task.logs)
+            assert any("Verification successful" in log for log in task.logs)
+
+        finally:
+            await cdp_browser.close()
+
+
+@pytest.mark.asyncio
+async def test_automatic_send_mode_still_pauses_for_ambiguous_contact(mock_whatsapp_server: str):
+    """Verify automatic send mode still safely halts at AMBIGUOUS_CONTACT when multiple candidates match."""
+    cdp_port = 9242
+    cdp_url = f"http://127.0.0.1:{cdp_port}"
+    target_url = f"{mock_whatsapp_server}/test-whatsapp"
+
+    service = WhatsAppAutomationService()
+
+    async with async_playwright() as p:
+        cdp_browser = await p.chromium.launch(
+            args=[f"--remote-debugging-port={cdp_port}", "--headless=new"]
+        )
+
+        try:
+            req = WhatsAppTaskRequest(
+                contact_name="Charlie",  # matches Charlie Brown and Charlie Davis
+                message="Testing automatic mode ambiguity safety",
+                send_mode=WhatsAppSendModeEnum.AUTOMATIC,
+                cdp_url=cdp_url,
+                target_url=target_url,
+            )
+
+            task = await service.start_task(req)
+
+            # Wait for AMBIGUOUS_CONTACT pause
+            for _ in range(40):
+                if task.status in {WhatsAppStateEnum.AMBIGUOUS_CONTACT, WhatsAppStateEnum.FAILED}:
+                    break
+                await asyncio.sleep(0.4)
+
+            assert task.status == WhatsAppStateEnum.AMBIGUOUS_CONTACT
+            assert len(task.candidates) >= 2
+
+            # User selects contact
+            await service.select_contact(task.task_id, "Charlie Brown")
+
+            # In automatic mode, it should now proceed to completion without waiting for send approval
+            for _ in range(50):
+                if task.status in {WhatsAppStateEnum.COMPLETED, WhatsAppStateEnum.FAILED}:
+                    break
+                await asyncio.sleep(0.4)
+
+            assert task.status == WhatsAppStateEnum.COMPLETED
+            assert task.verified_header_name == "Charlie Brown"
+
+        finally:
+            await cdp_browser.close()
+
+
+
+

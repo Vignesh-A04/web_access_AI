@@ -1,8 +1,9 @@
 import React, { useEffect, useState } from 'react';
-import { Header } from './components/Header';
+import { Header, ActiveViewMode } from './components/Header';
 import { TaskCreationForm } from './components/TaskCreationForm';
 import { LiveExecutionView } from './components/LiveExecutionView';
 import { WhatsAppAutomationView } from './components/WhatsAppAutomationView';
+import { WhatsAppChatbotView } from './components/WhatsAppChatbotView';
 import {
   ActionLogItem,
   HealthResponse,
@@ -26,7 +27,7 @@ import {
 } from './services/api';
 
 export const App: React.FC = () => {
-  const [activeMode, setActiveMode] = useState<'agent' | 'whatsapp'>('whatsapp');
+  const [activeMode, setActiveMode] = useState<ActiveViewMode>('chatbot');
   const [health, setHealth] = useState<HealthResponse | null>(null);
 
   // Generic agent state
@@ -227,7 +228,9 @@ export const App: React.FC = () => {
       />
 
       <main style={{ flex: 1 }}>
-        {activeMode === 'whatsapp' ? (
+        {activeMode === 'chatbot' ? (
+          <WhatsAppChatbotView health={health} />
+        ) : activeMode === 'whatsapp' ? (
           <WhatsAppAutomationView
             task={whatsappTask}
             isLoading={isWhatsAppLoading}

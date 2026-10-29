@@ -308,35 +308,190 @@ pytest -v tests/
 
 ## WhatsApp Web Contact Message Workflow (CDP Direct Mode)
 
-AgentOS includes an end-to-end WhatsApp Web workflow that attaches directly to an existing, authenticated Google Chrome browser instance via the **Chrome DevTools Protocol (CDP)**.
+AgentOS includes a verified, human-in-the-loop WhatsApp Web workflow that attaches directly to an existing, authenticated Google Chrome browser instance via the **Chrome DevTools Protocol (CDP)** at `http://127.0.0.1:9222`.
 
-### Security & Privacy Protections
-- **Zero Credential Exposure**: The agent **never** asks for, reads, stores, or logs WhatsApp credentials, authentication tokens, session cookies, QR code payloads, or unrelated private chat messages.
-- **Dedicated Browser Session**: Attaches non-destructively to your dedicated Chrome session without creating fresh unauthenticated profiles or restarting your browser.
-- **Strict Recipient Verification**: Verifies the active chat title in the conversation header (`#main header`) before drafting.
-- **No Blind Retries**: If message send status is ambiguous, the agent inspects the conversation history and never blind-retries a send.
-- **Human-in-the-Loop Send Confirmation**: The agent enters text into the message composer but **halts immediately**. It requires your explicit **Confirm & Send** click in the UI before clicking Send exactly once.
+### 1. Configuration & Mode Clarification
 
-### Launching Dedicated Chrome with CDP
-Before running the workflow, start Chrome with remote debugging enabled from Windows PowerShell:
+When the backend starts up, you will see logging such as:
+```text
+Browser headless: True | Local test mode: True
+```
+- **`BROWSER_HEADLESS=True`**: This setting applies **only** to the generic web agent when it launches a fresh, isolated Chromium context for standard web tasks. It **does not affect** the WhatsApp CDP connection, which attaches directly to your externally running, visible Chrome browser.
+- **`Local test mode: True` (`ALLOW_LOCAL_TEST_DOMAINS=true`)**: This setting allows the SSRF security policy (`url_policy.py`) to permit navigation to loopback addresses (`127.0.0.1` / `localhost`) for testing embedded demo pages (e.g. `/test-site` and `/test-whatsapp`). It **never** replaces real WhatsApp browser actions with mocks or simulated responses during live execution. In live mode, the agent targets `https://web.whatsapp.com` exclusively.
+
+### 2. Chrome CDP Preflight & Safety Checks
+
+To prevent generic `connect ECONNREFUSED 127.0.0.1:9222` exceptions, AgentOS implements a non-blocking **CDP connection preflight**:
+1. **Loopback Enforced**: Rejects connection attempts to any host other than `127.0.0.1` or `localhost` to protect against remote browser hijacking.
+2. **HTTP Version Probe**: Probes `http://127.0.0.1:9222/json/version` using HTTP before Playwright attempts CDP attachment.
+3. **Actionable Root Cause**: If Chrome is not running or listening, the workflow halts immediately and returns clear PowerShell instructions.
+4. **Session Ownership & Non-Destructive Disconnect**: The user retains full ownership of their Chrome session. When Playwright completes or disconnects (`browser.close()`), it cleanly detaches the CDP client—it **never** closes the user's Chrome window or active tabs.
+5. **Zero Credential Exposure**: The agent never reads, logs, stores, or extracts cookies, session tokens, QR code images, or private chat histories.
+
+### 3. Launching Dedicated Chrome with Remote Debugging
+
+Before initiating a WhatsApp workflow, launch a dedicated Chrome instance with remote debugging enabled from **Windows PowerShell**:
 
 ```powershell
 & "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="C:\ChromeWhatsAppProfile"
 ```
 
-1. In that Chrome window, open `https://web.whatsapp.com` and log in once (scan your QR code).
-2. Keep the Chrome window open. The agent will discover and use this active session.
+Verify that Chrome is listening on port 9222:
+```powershell
+Invoke-RestMethod -Uri http://127.0.0.1:9222/json/version
+```
+*(You should receive a JSON response showing the Chrome browser version and DevTools WebSocket URL).*
 
-### Workflow Lifecycle Steps
-1. **Connect CDP**: Attaches to `http://127.0.0.1:9222`.
-2. **Verify Login**: Confirms that your WhatsApp Web session is logged in. If a QR code is detected, pauses with state `AWAITING_MANUAL_LOGIN` and prompts you to authenticate.
-3. **Contact Search**: Searches for the recipient in WhatsApp's search bar.
-4. **Ambiguity Resolution**: If multiple candidates match, pauses with state `AMBIGUOUS_CONTACT` and prompts you to select the intended contact from the UI.
-5. **Header Verification**: Opens the chat and strictly verifies that `#main header` matches the selected contact.
-6. **Draft in Composer**: Types the message into `#main footer [contenteditable]` without sending.
-7. **Send Approval (Safety Gate)**: Displays a preview of the recipient, message text, and live screenshot. Pauses in state `WAITING_FOR_SEND_APPROVAL`.
-8. **Explicit Send Confirmation**: Only upon your confirmation does the agent click Send once.
-9. **Sent Verification**: Verifies that the outgoing message bubble appears in the conversation history before declaring success (`COMPLETED`).
+In that dedicated Chrome window:
+1. Navigate to `https://web.whatsapp.com`.
+2. Log in manually if required (scan the QR code using your phone).
+3. Keep the Chrome window open. AgentOS will automatically discover and reuse this authenticated session.
+
+### 4. Verified Workflow Lifecycle & Two Explicit Sending Modes
+
+The workflow supports two explicit sending modes selected via the UI toggle:
+
+* **Mode 1: Manual Approval Mode (Default)**
+  - Finds and strictly verifies the recipient header.
+  - Drafts the exact message in the composer.
+  - Renders an explicit recipient and message preview card with a live screenshot.
+  - Halts in state `WAITING_FOR_SEND_APPROVAL` and waits for explicit user confirmation before clicking Send.
+* **Mode 2: Automatic Send Mode**
+  - Requires explicit user selection on each task (defaults back to manual).
+  - Finds the exact contact and handles ambiguous matches safely (still pauses if multiple candidates match).
+  - Strictly verifies the recipient header matches the intended contact before composing.
+  - Fills the composer and clicks Send automatically once verified.
+  - Verifies the outgoing message bubble appears in the conversation before reporting success.
+  - **Never** automatically resends if the result is uncertain.
+
+#### 10-Step Lifecycle Details:
+1. **Preflight & CDP Connect**: Verifies loopback binding, checks `http://127.0.0.1:9222/json/version`, and attaches via `chromium.connect_over_cdp()`.
+2. **Login Verification**: Locates the WhatsApp Web tab and verifies that the chat list is visible. If a QR code is detected, halts with `AWAITING_MANUAL_LOGIN`.
+3. **Contact Search**: Searches for the requested recipient in the search box (`#side input[aria-label*='Search']`).
+4. **Ambiguity Resolution**: If multiple candidates match the query, pauses in `AMBIGUOUS_CONTACT` state and prompts the user to select the correct contact from the UI (even in automatic mode).
+5. **Open Conversation & Header Verification**: Opens the chosen conversation and strictly verifies that the active chat header (`#main header`) matches the selected contact name.
+6. **Draft in Composer**: Types the exact message into `#main footer [contenteditable]` without sending.
+7. **Preview Generation**: Captures a live screenshot of the drafted message and prepares a recipient + message preview.
+8. **Send Dispatch**:
+   - In *Manual Mode*: Pauses in state `WAITING_FOR_SEND_APPROVAL` for explicit user confirmation.
+   - In *Automatic Mode*: Logs explicit automatic mode selection and proceeds directly to sending.
+9. **Single-Click Send**: Clicks the Send button (`span[data-icon='send']`) exactly once.
+10. **Outgoing Bubble Verification**: Verifies that the sent message bubble appears in `#main` with the matching text. If the result is uncertain, marks the task failed and never blindly resends.
+
+### 5. Screenshot Endpoint & Polling Behavior
+
+- **Informative Status Responses**:
+  - If a task is still connecting, `GET /api/whatsapp/tasks/{task_id}/screenshot` returns HTTP 404 with detail `Screenshot pending: task is currently in state '...'`.
+  - If a task failed before any screenshot was captured (e.g. Chrome not running), returns HTTP 404 with detail `Screenshot unavailable: task failed before any screenshot was captured`.
+  - Once captured, returns HTTP 200 with the live `image/png` screenshot.
+- **Frontend Polling Termination**: The frontend stops polling as soon as the task reaches a terminal state (`COMPLETED`, `FAILED`, `CANCELLED`, `CONTACT_NOT_FOUND`, `AWAITING_MANUAL_LOGIN`), preventing infinite 404 polling loops.
+- **No Fabricated Previews**: The dashboard never fabricates screenshots or claims a live view when the session is disconnected.
+
+---
+
+## WhatsApp Incoming-Message AI Chatbot
+
+An autonomous, safety-gated conversational chatbot that attaches to your existing authenticated WhatsApp Web Chrome session via Chrome DevTools Protocol (CDP), monitors only explicitly selected contacts, detects new incoming messages, generates contextual replies using Google Gemini (`gemini-3.5-flash-lite`), and dispatches replies automatically only when all safety rules pass.
+
+### 1. Architecture and Data Flow
+
+```mermaid
+flowchart TD
+    subgraph Browser Engine [Chrome CDP: 127.0.0.1:9222]
+        ChromeSession[Authenticated WhatsApp Web Tab]
+        ChatList[Contact List & Unread Badges]
+        ActiveChat[Conversation Panel & Composer]
+    end
+
+    subgraph Chatbot Background Service
+        CDPClient[Playwright CDP Connector]
+        Detector[Incoming Message Bubble Extractor]
+        Deduplicator[SHA-256 Fingerprint & SQLite Store]
+    end
+
+    subgraph LLM & Safety Gates
+        SafetyPolicy[6-Stage Safety & Injection Guardrail]
+        Gemini[Centralized Gemini Client: gemini-3.5-flash-lite]
+        RateLimiter[Per-Contact Sliding Window Rate Limiter]
+    end
+
+    subgraph Frontend Control Dashboard
+        UI[React Chatbot Panel]
+        Allowlist[Explicit Allowlist Manager]
+        EmergencyStop[Global Emergency Stop]
+    end
+
+    UI -->|Start / Stop / Configure| Deduplicator
+    ChromeSession -->|CDP Session Attachment| CDPClient
+    CDPClient -->|Scan Monitored Contacts| ChatList
+    ChatList -->|Open Monitored Chat| ActiveChat
+    ActiveChat -->|Extract Incoming Bubbles| Detector
+    Detector -->|Generate Message Fingerprint| Deduplicator
+    Deduplicator -->|If DETECTED & Allowed| SafetyPolicy
+    SafetyPolicy -->|Pre-Filter Checks| Gemini
+    Gemini -->|Proposed Reply & Structured JSON| RateLimiter
+    RateLimiter -->|If Auto-Reply & Verified Header| ActiveChat
+    ActiveChat -->|Single Click Send & Outgoing Verification| Deduplicator
+    Deduplicator -->|SENT or SEND_UNCONFIRMED| UI
+```
+
+### 2. Windows PowerShell Setup & CDP Health Check
+
+1. **Launch Dedicated Chrome with CDP**:
+   ```powershell
+   & "C:\Program Files\Google\Chrome\Application\chrome.exe" `
+       --remote-debugging-port=9222 `
+       --user-data-dir="$env:LOCALAPPDATA\Google\Chrome\User Data\WhatsAppAutomation" `
+       https://web.whatsapp.com
+   ```
+2. **Verify CDP Endpoint Health**:
+   ```powershell
+   Invoke-RestMethod -Uri "http://127.0.0.1:9222/json/version"
+   ```
+   Must return browser version information and `webSocketDebuggerUrl`.
+3. **Manual WhatsApp Login**:
+   - In the opened Chrome window, scan the QR code with WhatsApp on your phone if prompted.
+   - Wait until chats and conversations are fully loaded.
+   - Antigravity never requests or stores WhatsApp passwords, QR codes, session tokens, or private browser cookies.
+
+### 3. Contact Allowlist & Safety Settings
+
+- **Default State**: Disabled by default (`enabled: false`, `auto_reply_enabled: false`).
+- **Empty Allowlist Safety**: An empty allowlist prevents monitoring and sending entirely.
+- **Strict Name Matching**: Matches exact contact names (case-insensitive). Never matches partial or ambiguous names.
+- **Per-Contact Controls**: Each contact can be individually paused or resumed at any time.
+- **Rate Limiting**: Configurable maximum replies per contact within a sliding time window (default: 5 replies per 15 minutes).
+- **Global Emergency Stop**: Instantly cancels background polling and detaches from the browser without closing your personal Chrome session.
+
+### 4. Safety Guardrails & Reply Policy
+
+Automated replies are dispatched only if **all** of the following conditions are satisfied:
+1. Chatbot is enabled and automatic reply mode is explicitly turned ON.
+2. The sender is explicitly allowlisted and unpaused.
+3. Message is confidently identified as new and incoming (`.message-in`).
+4. Message fingerprint has never been previously processed (durable SQLite deduplication).
+5. Message content passes pre-LLM safety filters (blocks financial requests, medical/legal advice, harassment, prompt injections, and credentials).
+6. Gemini response passes JSON validation (`intent`, `confidence >= 0.7`, `safety_passed == true`, `requires_manual_review == false`).
+7. Proposed reply is within maximum character length (default: 160 characters).
+8. Contact has not exceeded configured rate limits within the sliding window.
+9. Active conversation header (`#main header`) matches the sender name immediately prior to composing.
+10. Send is dispatched with a single click and verified via outgoing message bubble detection.
+
+### 5. Durable Deduplication & Uncertain Send Reconciliation
+
+- **Cryptographic Fingerprint**: Generated via `SHA-256(sender:incoming_text:timestamp:dom_id)`.
+- **Crash Safety**: Stored atomically in local SQLite (`task_artifacts/chatbot.db`). Process restarts never trigger duplicate replies.
+- **Uncertain Sends (`SEND_UNCONFIRMED`)**:
+  - If Playwright encounters a timeout or inconclusive DOM verification after clicking Send, the message is marked `SEND_UNCONFIRMED`.
+  - The chatbot **never** automatically resends an unconfirmed message.
+  - The user can inspect the message in the dashboard and click **Reconcile** to manually verify whether it appeared in WhatsApp, marking it `SENT` or `SKIPPED`.
+
+### 6. Limitations of DOM-Based WhatsApp Monitoring
+
+- **Virtualization**: WhatsApp Web virtualizes chat history; only currently visible or recently loaded bubbles exist in the DOM.
+- **Non-Standard IDs**: WhatsApp Web frequently obfuscates element classes and does not expose persistent server message UUIDs in the DOM.
+- **Single Active Tab**: Only one conversation can be open and focused at a time in WhatsApp Web.
+- **Browser Disconnection**: If Chrome or CDP is closed, monitoring halts safely and logs a disconnection reason without crashing.
 
 ---
 
@@ -357,6 +512,18 @@ Before running the workflow, start Chrome with remote debugging enabled from Win
 | `POST` | `/api/whatsapp/tasks/{task_id}/approve-send` | Explicitly approve or reject sending the drafted message |
 | `POST` | `/api/whatsapp/tasks/{task_id}/cancel` | Safely cancel WhatsApp task and clear the composer |
 | `GET` | `/api/whatsapp/tasks/{task_id}/screenshot` | Retrieve latest WhatsApp automation screenshot |
+| `GET` | `/api/chatbot/config` | Retrieve chatbot configuration and allowlist settings |
+| `POST` | `/api/chatbot/config` | Update chatbot configuration (rate limits, auto-reply, intervals) |
+| `GET` | `/api/chatbot/status` | Retrieve chatbot runtime status and recent messages |
+| `POST` | `/api/chatbot/start` | Start background incoming message monitor |
+| `POST` | `/api/chatbot/stop` | Stop background monitor safely |
+| `POST` | `/api/chatbot/contacts` | Add a verified contact to the explicit allowlist |
+| `DELETE` | `/api/chatbot/contacts/{contact_name}` | Remove a contact from the allowlist |
+| `POST` | `/api/chatbot/contacts/{contact_name}/pause` | Pause automated replies for a specific contact |
+| `POST` | `/api/chatbot/contacts/{contact_name}/resume` | Resume automated replies for a paused contact |
+| `GET` | `/api/chatbot/messages` | List recent incoming messages and their processing lifecycle |
+| `GET` | `/api/chatbot/messages/{message_id}` | Retrieve individual message processing record |
+| `POST` | `/api/chatbot/messages/{message_id}/reconcile` | Reconcile an unconfirmed send without blind resending |
 | `GET` | `/test-site` | Embedded local demo test website |
 | `POST` | `/test-site/submit` | Form submission endpoint for local testing |
 | `GET` | `/test-whatsapp` | Embedded local WhatsApp Web DOM simulation for offline tests |

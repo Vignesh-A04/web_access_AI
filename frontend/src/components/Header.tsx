@@ -2,12 +2,14 @@ import React from 'react';
 import { Bot, Shield, Cpu, RefreshCw, ExternalLink, MessageSquare } from 'lucide-react';
 import { HealthResponse } from '../types';
 
+export type ActiveViewMode = 'agent' | 'whatsapp' | 'chatbot';
+
 interface HeaderProps {
   health: HealthResponse | null;
   onRefreshHealth: () => void;
   onNewTaskClick: () => void;
-  activeMode: 'agent' | 'whatsapp';
-  onModeChange: (mode: 'agent' | 'whatsapp') => void;
+  activeMode: ActiveViewMode;
+  onModeChange: (mode: ActiveViewMode) => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -43,7 +45,7 @@ export const Header: React.FC<HeaderProps> = ({
             </span>
           </div>
           <p style={{ fontSize: '0.8rem', color: '#94a3b8' }}>
-            Autonomous browser inspection, verified execution, and consequential action approvals
+            Autonomous browser inspection, verified execution, and conversational AI WhatsApp monitoring
           </p>
         </div>
       </div>
@@ -98,7 +100,28 @@ export const Header: React.FC<HeaderProps> = ({
           }}
         >
           <MessageSquare size={15} />
-          <span>WhatsApp Messenger</span>
+          <span>WhatsApp Sender</span>
+        </button>
+
+        <button
+          onClick={() => onModeChange('chatbot')}
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: '0.4rem',
+            padding: '0.45rem 0.9rem',
+            borderRadius: '8px',
+            fontSize: '0.82rem',
+            fontWeight: 600,
+            border: 'none',
+            cursor: 'pointer',
+            background: activeMode === 'chatbot' ? 'rgba(168, 85, 247, 0.25)' : 'transparent',
+            color: activeMode === 'chatbot' ? '#c084fc' : '#94a3b8',
+            boxShadow: activeMode === 'chatbot' ? '0 0 10px rgba(168, 85, 247, 0.2)' : 'none',
+          }}
+        >
+          <Bot size={15} />
+          <span>AI Chatbot</span>
         </button>
       </div>
 
