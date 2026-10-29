@@ -22,6 +22,7 @@ import {
   ExternalLink,
   Send,
   Zap,
+  RotateCcw,
 } from 'lucide-react';
 import {
   ChatbotConfig,
@@ -40,6 +41,7 @@ import {
   removeChatbotContact,
   pauseChatbotContact,
   resumeChatbotContact,
+  resetChatbotContactRateLimit,
   reconcileChatbotMessage,
   approveChatbotMessage,
   dismissChatbotMessage,
@@ -67,6 +69,9 @@ export const WhatsAppChatbotView: React.FC<WhatsAppChatbotViewProps> = ({ health
   // Reconciliation modal state
   const [reconcilingMsg, setReconcilingMsg] = useState<ChatbotMessageRecord | null>(null);
   const [reconcileNotes, setReconcileNotes] = useState('');
+
+  // Reset rate limit modal state
+  const [resetContactModal, setResetContactModal] = useState<string | null>(null);
 
   const loadStatus = useCallback(async (quiet = false) => {
     if (!quiet) setLoading(true);
@@ -226,6 +231,21 @@ export const WhatsAppChatbotView: React.FC<WhatsAppChatbotViewProps> = ({ health
       await loadStatus(true);
     } catch (err: any) {
       setErrorMsg(err.message || 'Failed to toggle pause contact');
+    } finally {
+      setActionLoading(false);
+    }
+  };
+
+  const handleConfirmResetRateLimit = async (contactName: string) => {
+    setActionLoading(true);
+    setErrorMsg(null);
+    try {
+      const res = await resetChatbotContactRateLimit(contactName);
+      setResetContactModal(null);
+      await loadStatus(true);
+      setSuccessMsg(res.message || `Rate limit reset successfully for '${contactName}'.`);
+    } catch (err: any) {
+      setErrorMsg(err.message || `Failed to reset rate limit for '${contactName}'`);
     } finally {
       setActionLoading(false);
     }
@@ -673,6 +693,29 @@ export const WhatsAppChatbotView: React.FC<WhatsAppChatbotViewProps> = ({ health
                     </div>
 
                     <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                      <button
+                        onClick={() => setResetContactModal(contactName)}
+                        title={`Reset rate limit for ${contactName}`}
+                        id={`reset-rate-limit-${contactName.toLowerCase().replace(/\s+/g, '-')}`}
+                        disabled={actionLoading}
+                        style={{
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          gap: '4px',
+                          background: 'rgba(59, 130, 246, 0.12)',
+                          border: '1px solid rgba(59, 130, 246, 0.28)',
+                          color: '#60a5fa',
+                          borderRadius: '6px',
+                          cursor: 'pointer',
+                          padding: '3px 8px',
+                          fontSize: '0.72rem',
+                          fontWeight: 500,
+                          transition: 'all 0.2s ease',
+                        }}
+                      >
+                        <RotateCcw size={12} />
+                        <span>Reset Rate Limit</span>
+                      </button>
                       <button
                         onClick={() => handleTogglePauseContact(contactName, c.is_paused)}
                         title={c.is_paused ? 'Resume monitoring' : 'Pause monitoring'}
@@ -1145,6 +1188,91 @@ export const WhatsAppChatbotView: React.FC<WhatsAppChatbotViewProps> = ({ health
                 }}
               >
                 Confirm as SENT
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Reset Rate Limit Confirmation Modal */}
+      {resetContactModal && (
+        <div style={{
+          position: 'fixed',
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          backgroundColor: 'rgba(0, 0, 0, 0.75)',
+          backdropFilter: 'blur(4px)',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          zIndex: 1000,
+          padding: '1rem',
+        }}>
+          <div className="glass-panel" style={{
+            maxWidth: '480px',
+            width: '100%',
+            background: '#0f172a',
+            border: '1px solid rgba(59, 130, 246, 0.4)',
+            borderRadius: '12px',
+            padding: '1.5rem',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '1rem',
+            boxShadow: '0 20px 25px -5px rgba(0, 0, 0, 0.5), 0 8px 10px -6px rgba(0, 0, 0, 0.5)',
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', color: '#60a5fa' }}>
+              <RotateCcw size={22} />
+              <h3 style={{ margin: 0, fontSize: '1.1rem', fontWeight: 700 }}>
+                Reset Rate Limit
+              </h3>
+            </div>
+
+            <p style={{ fontSize: '0.88rem', color: '#cbd5e1', margin: 0, lineHeight: 1.5 }}>
+              Are you sure you want to reset the rolling rate limit for <strong style={{ color: '#60a5fa' }}>{resetContactModal}</strong>?
+            </p>
+
+            <div style={{ background: 'rgba(30, 41, 59, 0.8)', padding: '0.75rem', borderRadius: '8px', fontSize: '0.82rem', color: '#94a3b8', lineHeight: 1.4 }}>
+              This will clear sent-reply rate-limit history for <strong>{resetContactModal}</strong> in the current active time window ({statusData?.config?.rate_limit_window_minutes ?? 15} min). The configured limit ({statusData?.config?.max_replies_per_contact_window ?? 5} replies/window) and other contacts remain unaffected.
+            </div>
+
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.75rem', marginTop: '0.5rem' }}>
+              <button
+                onClick={() => setResetContactModal(null)}
+                disabled={actionLoading}
+                style={{
+                  padding: '0.5rem 1rem',
+                  borderRadius: '6px',
+                  background: 'transparent',
+                  color: '#94a3b8',
+                  border: '1px solid rgba(255, 255, 255, 0.1)',
+                  cursor: 'pointer',
+                  fontSize: '0.85rem',
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => handleConfirmResetRateLimit(resetContactModal)}
+                disabled={actionLoading}
+                id="confirm-reset-rate-limit-button"
+                style={{
+                  padding: '0.5rem 1rem',
+                  borderRadius: '6px',
+                  background: 'linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%)',
+                  color: '#ffffff',
+                  border: 'none',
+                  cursor: 'pointer',
+                  fontSize: '0.85rem',
+                  fontWeight: 600,
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '6px',
+                }}
+              >
+                <RotateCcw size={14} />
+                <span>{actionLoading ? 'Resetting...' : 'Confirm Reset'}</span>
               </button>
             </div>
           </div>

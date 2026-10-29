@@ -145,6 +145,7 @@ export interface ChatbotContactItem {
   is_paused: boolean;
   added_at: string;
   notes?: string | null;
+  rate_limit_reset_at?: string | null;
 }
 
 export interface ChatbotAddContactRequest {
@@ -204,6 +205,14 @@ export interface ChatbotStatusResponse {
   last_check_timestamp?: string | null;
   last_error?: string | null;
 }
+
+export interface ChatbotResetRateLimitResponse {
+  status: string;
+  contact_name: string;
+  message: string;
+  rate_limit_reset_at: string;
+}
+
 
 
 

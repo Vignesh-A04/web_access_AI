@@ -8,6 +8,7 @@ import {
   ChatbotConfig,
   ChatbotConfigUpdateRequest,
   ChatbotMessageRecord,
+  ChatbotResetRateLimitResponse,
   ChatbotStatusResponse,
 } from '../types';
 
@@ -238,6 +239,17 @@ export async function resumeChatbotContact(contactName: string): Promise<Chatbot
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
     throw new Error(formatApiError(err, `Failed to resume contact (${res.status})`));
+  }
+  return res.json();
+}
+
+export async function resetChatbotContactRateLimit(contactName: string): Promise<ChatbotResetRateLimitResponse> {
+  const res = await fetch(`${API_BASE}/api/chatbot/contacts/${encodeURIComponent(contactName.trim())}/reset-rate-limit`, {
+    method: 'POST',
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(formatApiError(err, `Failed to reset rate limit (${res.status})`));
   }
   return res.json();
 }
