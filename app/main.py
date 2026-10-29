@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.routes import api_router, test_site_router
 from app.config import settings
 from app.logging.setup import get_logger, setup_logging
+from app.services.chatbot_store import chatbot_store
 from app.services.task_service import task_service
 
 # Initialize logging early
@@ -25,6 +26,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         f"| Browser headless: {settings.browser_headless} "
         f"| Local test mode: {settings.allow_local_test_domains}"
     )
+
+    # Always enforce safe startup: automatic sending disabled after restart
+    try:
+        chatbot_store.reset_startup_safety_flags()
+    except Exception as e:
+        logger.warning(f"Could not reset chatbot startup safety flags: {e}")
 
     yield
 

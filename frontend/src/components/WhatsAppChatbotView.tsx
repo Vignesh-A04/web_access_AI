@@ -20,6 +20,8 @@ import {
   Check,
   X,
   ExternalLink,
+  Send,
+  Zap,
 } from 'lucide-react';
 import {
   ChatbotConfig,
@@ -39,6 +41,8 @@ import {
   pauseChatbotContact,
   resumeChatbotContact,
   reconcileChatbotMessage,
+  approveChatbotMessage,
+  dismissChatbotMessage,
 } from '../services/api';
 
 interface WhatsAppChatbotViewProps {
@@ -85,14 +89,19 @@ export const WhatsAppChatbotView: React.FC<WhatsAppChatbotViewProps> = ({ health
     }
   }, [configSaving]);
 
-  // Initial load and periodic status polling
+  // Initial load and adaptive status polling
   useEffect(() => {
     loadStatus();
+  }, [loadStatus]);
+
+  useEffect(() => {
+    const isBusy = statusData?.is_running || (statusData?.recent_messages || []).some(m => m.status === 'GENERATING' || m.status === 'SENDING');
+    const pollInterval = isBusy ? 1500 : 4000;
     const interval = setInterval(() => {
       loadStatus(true);
-    }, 4000);
+    }, pollInterval);
     return () => clearInterval(interval);
-  }, [loadStatus]);
+  }, [loadStatus, statusData?.is_running, statusData?.recent_messages]);
 
   // Temporary flash message clearer
   useEffect(() => {
@@ -229,6 +238,34 @@ export const WhatsAppChatbotView: React.FC<WhatsAppChatbotViewProps> = ({ health
       setSuccessMsg(`Message reconciled as ${confirmed ? 'SENT' : 'SKIPPED'}.`);
     } catch (err: any) {
       setErrorMsg(err.message || 'Failed to reconcile message');
+    } finally {
+      setActionLoading(false);
+    }
+  };
+
+  const handleApproveSend = async (messageId: string) => {
+    setActionLoading(true);
+    setErrorMsg(null);
+    try {
+      await approveChatbotMessage(messageId);
+      setSuccessMsg('Candidate reply approved and sent successfully.');
+      await loadStatus(true);
+    } catch (err: any) {
+      setErrorMsg(err.message || 'Failed to send approved reply');
+    } finally {
+      setActionLoading(false);
+    }
+  };
+
+  const handleDismiss = async (messageId: string) => {
+    setActionLoading(true);
+    setErrorMsg(null);
+    try {
+      await dismissChatbotMessage(messageId);
+      setSuccessMsg('Proposal dismissed without sending.');
+      await loadStatus(true);
+    } catch (err: any) {
+      setErrorMsg(err.message || 'Failed to dismiss proposal');
     } finally {
       setActionLoading(false);
     }
@@ -832,6 +869,7 @@ export const WhatsAppChatbotView: React.FC<WhatsAppChatbotViewProps> = ({ health
                   <th style={{ padding: '0.6rem 0.8rem' }}>Sender</th>
                   <th style={{ padding: '0.6rem 0.8rem' }}>Incoming Message</th>
                   <th style={{ padding: '0.6rem 0.8rem' }}>Generated AI Reply</th>
+                  <th style={{ padding: '0.6rem 0.8rem' }}>Latency / Stages</th>
                   <th style={{ padding: '0.6rem 0.8rem' }}>Skip Reason / Notes</th>
                   <th style={{ padding: '0.6rem 0.8rem' }}>Actions</th>
                 </tr>
@@ -859,6 +897,54 @@ export const WhatsAppChatbotView: React.FC<WhatsAppChatbotViewProps> = ({ health
                         <span style={{ color: '#64748b' }}>—</span>
                       )}
                     </td>
+                    <td style={{ padding: '0.75rem 0.8rem', whiteSpace: 'nowrap' }}>
+                      {m.total_duration_ms != null ? (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '3px' }}>
+                          <span style={{
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            gap: '4px',
+                            fontWeight: 700,
+                            color: m.total_duration_ms > 20000 ? '#f43f5e' : m.total_duration_ms > 10000 ? '#38bdf8' : '#34d399',
+                            fontSize: '0.78rem'
+                          }}>
+                            <Zap size={12} />
+                            {m.total_duration_ms >= 1000
+                              ? `${(m.total_duration_ms / 1000).toFixed(1)}s`
+                              : `${Math.round(m.total_duration_ms)}ms`}
+                          </span>
+                          {m.stage_timings && (
+                            <div style={{ fontSize: '0.68rem', color: '#94a3b8', display: 'flex', gap: '4px', flexWrap: 'wrap' }}>
+                              {m.stage_timings.gemini_request_ms != null && (
+                                <span title={`Gemini LLM: ${m.stage_timings.gemini_request_ms}ms`}>
+                                  LLM: {(m.stage_timings.gemini_request_ms / 1000).toFixed(1)}s
+                                </span>
+                              )}
+                              {m.stage_timings.playwright_send_ms != null && m.stage_timings.playwright_send_ms > 0 && (
+                                <span title={`Browser Send: ${m.stage_timings.playwright_send_ms}ms`}>
+                                  Send: {(m.stage_timings.playwright_send_ms / 1000).toFixed(1)}s
+                                </span>
+                              )}
+                              {m.stage_timings.verification_ms != null && m.stage_timings.verification_ms > 0 && (
+                                <span title={`Verification: ${m.stage_timings.verification_ms}ms`}>
+                                  Verif: {(m.stage_timings.verification_ms / 1000).toFixed(1)}s
+                                </span>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      ) : m.status === 'GENERATING' ? (
+                        <span style={{ fontSize: '0.75rem', color: '#38bdf8', fontStyle: 'italic', display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
+                          <Sparkles size={11} /> Generating...
+                        </span>
+                      ) : m.status === 'SENDING' ? (
+                        <span style={{ fontSize: '0.75rem', color: '#c084fc', fontStyle: 'italic', display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
+                          <Bot size={11} /> Sending...
+                        </span>
+                      ) : (
+                        <span style={{ color: '#64748b' }}>—</span>
+                      )}
+                    </td>
                     <td style={{ padding: '0.75rem 0.8rem', color: '#94a3b8', maxWidth: '200px' }}>
                       {m.skip_reason ? (
                         <div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={m.skip_reason}>
@@ -869,6 +955,47 @@ export const WhatsAppChatbotView: React.FC<WhatsAppChatbotViewProps> = ({ health
                       )}
                     </td>
                     <td style={{ padding: '0.75rem 0.8rem', whiteSpace: 'nowrap' }}>
+                      {m.status === 'READY_TO_SEND' && (
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                          <button
+                            onClick={() => handleApproveSend(m.id)}
+                            disabled={actionLoading}
+                            title="Explicitly approve and dispatch this reply now"
+                            style={{
+                              background: 'linear-gradient(135deg, #10b981 0%, #059669 100%)',
+                              color: '#ffffff',
+                              border: 'none',
+                              borderRadius: '6px',
+                              padding: '4px 10px',
+                              fontSize: '0.75rem',
+                              fontWeight: 700,
+                              cursor: actionLoading ? 'not-allowed' : 'pointer',
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: '4px',
+                            }}
+                          >
+                            <Send size={12} /> Approve & Send
+                          </button>
+                          <button
+                            onClick={() => handleDismiss(m.id)}
+                            disabled={actionLoading}
+                            title="Dismiss this reply proposal without sending"
+                            style={{
+                              background: 'rgba(239, 68, 68, 0.15)',
+                              color: '#fca5a5',
+                              border: '1px solid rgba(239, 68, 68, 0.4)',
+                              borderRadius: '6px',
+                              padding: '4px 8px',
+                              fontSize: '0.75rem',
+                              fontWeight: 600,
+                              cursor: actionLoading ? 'not-allowed' : 'pointer',
+                            }}
+                          >
+                            Dismiss
+                          </button>
+                        </div>
+                      )}
                       {m.status === 'SEND_UNCONFIRMED' && (
                         <button
                           onClick={() => setReconcilingMsg(m)}
@@ -885,6 +1012,9 @@ export const WhatsAppChatbotView: React.FC<WhatsAppChatbotViewProps> = ({ health
                         >
                           Reconcile
                         </button>
+                      )}
+                      {m.status !== 'READY_TO_SEND' && m.status !== 'SEND_UNCONFIRMED' && (
+                        <span style={{ color: '#475569' }}>—</span>
                       )}
                     </td>
                   </tr>

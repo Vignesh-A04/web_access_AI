@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import json
 import re
+import time
 from typing import Any, Callable, Dict, List, Optional
 from google.genai import Client, types
 from google.genai.errors import APIError
@@ -23,6 +24,9 @@ class ChatbotReplyResult(BaseModel):
     requires_manual_review: bool = False
     safety_passed: bool = True
     reason: Optional[str] = None
+    is_error: bool = False
+    error_code: Optional[int] = None
+    duration_seconds: float = 0.0
 
     @property
     def proposed_reply(self) -> str:
@@ -105,7 +109,7 @@ class ChatbotReplyService:
         incoming_text: str,
         context_messages: Optional[List[str]] = None,
         system_instructions: Optional[str] = None,
-        timeout_seconds: float = 15.0,
+        timeout_seconds: float = 25.0,
     ) -> ChatbotReplyResult:
         """Generate a contextual reply for an incoming message after validating safety policies."""
         text = incoming_text.strip()
@@ -199,6 +203,7 @@ class ChatbotReplyService:
                     confidence=0.0,
                     requires_manual_review=True,
                     safety_passed=False,
+                    is_error=True,
                     reason=f"Mock responder error: {e}",
                 )
 
@@ -210,6 +215,7 @@ class ChatbotReplyService:
                 confidence=0.0,
                 requires_manual_review=True,
                 safety_passed=False,
+                is_error=True,
                 reason="Gemini API is not configured. Set GEMINI_API_KEY in environment.",
             )
 
@@ -230,45 +236,85 @@ class ChatbotReplyService:
             response_mime_type="application/json",
         )
 
-        # 5. Call Gemini
-        try:
-            response = await asyncio.wait_for(
-                self._client.aio.models.generate_content(
-                    model=self.model,
-                    contents=user_content,
-                    config=config,
-                ),
-                timeout=timeout_seconds,
-            )
-        except asyncio.TimeoutError:
-            logger.warning(f"Gemini reply generation timed out after {timeout_seconds}s for '{sender_name}'")
+        # 5. Call Gemini with transient retry for 503/429
+        response = None
+        last_error_code: Optional[int] = None
+        last_error_msg: Optional[str] = None
+        t_api_start = time.perf_counter()
+
+        for attempt in range(2):
+            try:
+                response = await asyncio.wait_for(
+                    self._client.aio.models.generate_content(
+                        model=self.model,
+                        contents=user_content,
+                        config=config,
+                    ),
+                    timeout=timeout_seconds,
+                )
+                break
+            except asyncio.TimeoutError:
+                elapsed = time.perf_counter() - t_api_start
+                logger.warning(f"Gemini reply generation timed out after {elapsed:.1f}s for '{sender_name}'")
+                # Fail fast on timeout: do not double wait time with an immediate second timeout
+                return ChatbotReplyResult(
+                    reply="",
+                    intent="unknown",
+                    confidence=0.0,
+                    requires_manual_review=True,
+                    safety_passed=False,
+                    is_error=True,
+                    duration_seconds=elapsed,
+                    reason=f"Gemini API timed out after {timeout_seconds}s.",
+                )
+            except APIError as e:
+                code = getattr(e, "code", None) or 500
+                msg = getattr(e, "message", str(e))
+                last_error_code = code
+                last_error_msg = msg
+                elapsed = time.perf_counter() - t_api_start
+                logger.warning(f"Gemini API error (code {code}) on attempt {attempt + 1}: {msg}")
+                # Transient retry for 503 (high demand) or 429 (rate spike)
+                if attempt == 0 and code in (503, 429, 500):
+                    await asyncio.sleep(1.5)
+                    continue
+                return ChatbotReplyResult(
+                    reply="",
+                    intent="unknown",
+                    confidence=0.0,
+                    requires_manual_review=True,
+                    safety_passed=False,
+                    is_error=True,
+                    error_code=code,
+                    duration_seconds=elapsed,
+                    reason=f"Gemini API error [{code}]: {msg}",
+                )
+            except Exception as e:
+                elapsed = time.perf_counter() - t_api_start
+                logger.error(f"Unexpected error communicating with Gemini for chatbot reply: {e}")
+                return ChatbotReplyResult(
+                    reply="",
+                    intent="unknown",
+                    confidence=0.0,
+                    requires_manual_review=True,
+                    safety_passed=False,
+                    is_error=True,
+                    duration_seconds=elapsed,
+                    reason=f"Gemini error: {e}",
+                )
+
+        api_elapsed = time.perf_counter() - t_api_start
+        if response is None:
             return ChatbotReplyResult(
                 reply="",
                 intent="unknown",
                 confidence=0.0,
                 requires_manual_review=True,
                 safety_passed=False,
-                reason=f"Gemini API timed out after {timeout_seconds}s.",
-            )
-        except APIError as e:
-            logger.error(f"Gemini API error during reply generation: {e.message} (code {e.code})")
-            return ChatbotReplyResult(
-                reply="",
-                intent="unknown",
-                confidence=0.0,
-                requires_manual_review=True,
-                safety_passed=False,
-                reason=f"Gemini API error: {e.message}",
-            )
-        except Exception as e:
-            logger.error(f"Unexpected error communicating with Gemini for chatbot reply: {e}")
-            return ChatbotReplyResult(
-                reply="",
-                intent="unknown",
-                confidence=0.0,
-                requires_manual_review=True,
-                safety_passed=False,
-                reason=f"Gemini error: {e}",
+                is_error=True,
+                error_code=last_error_code,
+                duration_seconds=api_elapsed,
+                reason=last_error_msg or "Failed to receive response from Gemini.",
             )
 
         # 6. Parse and Validate Model Output
@@ -286,6 +332,7 @@ class ChatbotReplyService:
                 confidence=float(data.get("confidence", 0.5)),
                 requires_manual_review=bool(data.get("requires_manual_review", False)),
                 safety_passed=bool(data.get("safety_passed", True)),
+                duration_seconds=api_elapsed,
                 reason=data.get("reason"),
             )
 
@@ -305,6 +352,8 @@ class ChatbotReplyService:
                 confidence=0.0,
                 requires_manual_review=True,
                 safety_passed=False,
+                is_error=True,
+                duration_seconds=api_elapsed,
                 reason=f"Failed to parse valid structured response from Gemini: {e}",
             )
 

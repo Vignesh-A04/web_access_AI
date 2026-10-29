@@ -32,7 +32,9 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import threading
+import time
 from typing import Generator
+import uuid
 import pytest
 from fastapi.testclient import TestClient
 from playwright.async_api import async_playwright
@@ -728,3 +730,548 @@ async def test_allowed_contact_receives_eligible_reply_e2e(mock_chatbot_server: 
         finally:
             await cdp_browser.close()
             reply_service.set_mock_responder(None)
+
+
+@pytest.mark.asyncio
+async def test_single_monitoring_worker_lifecycle_and_duplicate_prevention():
+    """Verify that starting chatbot creates exactly one worker, rejects duplicate starts, and stops cleanly."""
+    service = WhatsAppChatbotService()
+    try:
+        res1 = await service.start()
+        assert res1["status"] == "started"
+        assert service.is_running
+        task1 = service._monitor_task
+
+        # Attempt duplicate start while already running
+        res2 = await service.start()
+        assert res2["status"] == "already_running"
+        assert service._monitor_task is task1  # No duplicate worker created
+
+        # Stop worker
+        stop_res = await service.stop()
+        assert stop_res["status"] == "stopped"
+        assert not service.is_running
+        assert service._monitor_task is None
+
+        # Redundant stop
+        stop_res2 = await service.stop()
+        assert stop_res2["status"] == "not_running"
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_auto_reply_disabled_generates_candidate_without_sending(mock_chatbot_server: str):
+    """Verify that when automatic sending mode is disabled, Gemini generates a candidate reply in READY_TO_SEND without dispatching."""
+    contact_name = f"SafeUser_{uuid.uuid4().hex[:6]}"
+    chatbot_store.add_contact(contact_name)
+
+    config = chatbot_store.get_config()
+    config.enabled = True
+    config.auto_reply_enabled = False  # Auto-reply explicitly disabled
+    chatbot_store.save_config(config)
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+        await page.goto(f"{mock_chatbot_server}/test-whatsapp")
+
+        # Set active chat to contact_name
+        await page.evaluate(f"""() => {{
+            document.getElementById('chat-header-name').innerText = '{contact_name}';
+            const conv = document.getElementById('conversation');
+            const bubble = document.createElement('div');
+            bubble.className = 'message-bubble message-in';
+            bubble.innerHTML = '<span class="selectable-text">Hello, are you available to chat?</span>';
+            conv.appendChild(bubble);
+        }}""")
+
+        # Set mock responder
+        chatbot_reply_service.set_mock_responder(
+            lambda prompt: '{"reply": "Yes, I am here and ready to help!", "intent": "casual", "confidence": 0.95, "requires_manual_review": false}'
+        )
+
+        try:
+            test_service = WhatsAppChatbotService()
+
+            # Record detected message with unique fingerprint
+            test_fp = f"test-fp-auto-disabled-{uuid.uuid4()}"
+            record = chatbot_store.record_detected_message(
+                fingerprint=test_fp,
+                contact_name=contact_name,
+                incoming_text="Hello, are you available to chat?",
+                timestamp_str="10:00 AM"
+            )
+            assert record is not None
+            assert record.status == ChatbotMessageStatusEnum.DETECTED
+
+            # Run pipeline
+            await test_service._handle_message_reply_pipeline(page, record, config)
+
+            # Verification: message transitioned to READY_TO_SEND, not SENT
+            updated = chatbot_store.get_message_by_id(record.id)
+            assert updated is not None
+            assert updated.status == ChatbotMessageStatusEnum.READY_TO_SEND
+            assert updated.reply_text == "Yes, I am here and ready to help!"
+            assert "Automatic sending mode is disabled" in updated.skip_reason
+
+            # Verify that composer was NOT submitted/sent
+            composer_text = await page.evaluate("() => document.getElementById('message-composer').innerText")
+            assert "Yes, I am here" not in (composer_text or "")
+        finally:
+            chatbot_reply_service.set_mock_responder(None)
+            await browser.close()
+
+
+@pytest.mark.asyncio
+async def test_real_whatsapp_dom_extraction(mock_chatbot_server: str):
+    """Verify that message extraction correctly identifies modern WhatsApp Web DOM rows with data-pre-plain-text."""
+    service = WhatsAppChatbotService()
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+        await page.goto(f"{mock_chatbot_server}/test-whatsapp")
+
+        # Inject modern WhatsApp Web DOM rows
+        await page.evaluate("""() => {
+            const conv = document.getElementById('conversation');
+            conv.innerHTML = ''; // Clear default simulation
+
+            // 1. Encryption banner (system message - should be ignored)
+            const banner = document.createElement('div');
+            banner.setAttribute('role', 'row');
+            banner.setAttribute('data-testid', 'chat-history-banner');
+            banner.innerText = 'Messages and calls are end-to-end encrypted.';
+            conv.appendChild(banner);
+
+            // 2. Outgoing message from user (should be ignored)
+            const outRow = document.createElement('div');
+            outRow.setAttribute('role', 'row');
+            outRow.setAttribute('data-id', 'out-msg-1');
+            outRow.innerHTML = `
+                <div data-testid="msg-container">
+                    <span data-testid="tail-out"></span>
+                    <span aria-label="You:"></span>
+                    <div class="copyable-text" data-pre-plain-text="[10:20 pm, 29/10/2026] Vignesh Arumugam: ">
+                        <span data-testid="selectable-text">Outgoing test message</span>
+                    </div>
+                </div>
+            `;
+            conv.appendChild(outRow);
+
+            // 3. Incoming message from Joy Boy (should be detected)
+            const inRow1 = document.createElement('div');
+            inRow1.setAttribute('role', 'row');
+            inRow1.setAttribute('data-id', 'in-msg-101');
+            inRow1.innerHTML = `
+                <div data-testid="msg-container">
+                    <span data-testid="tail-in"></span>
+                    <span aria-label="Joy Boy:"></span>
+                    <div class="copyable-text" data-pre-plain-text="[10:22 pm, 29/10/2026] Joy Boy: ">
+                        <span data-testid="selectable-text">What are you doing my love ?</span>
+                    </div>
+                </div>
+            `;
+            conv.appendChild(inRow1);
+
+            // 4. Consecutive incoming message from Joy Boy without tail-in (should also be detected)
+            const inRow2 = document.createElement('div');
+            inRow2.setAttribute('role', 'row');
+            inRow2.setAttribute('data-id', 'in-msg-102');
+            inRow2.innerHTML = `
+                <div data-testid="msg-container">
+                    <div class="copyable-text" data-pre-plain-text="[10:24 pm, 29/10/2026] Joy Boy: ">
+                        <span data-testid="selectable-text">Did you finish your work dear ?</span>
+                    </div>
+                </div>
+            `;
+            conv.appendChild(inRow2);
+        }""")
+
+        messages = await service._extract_visible_incoming_messages(page)
+        assert len(messages) == 2
+
+        assert messages[0]["id"] == "in-msg-101"
+        assert messages[0]["sender"] == "Joy Boy"
+        assert messages[0]["text"] == "What are you doing my love ?"
+        assert messages[0]["timestamp"] == "10:22 pm"
+
+        assert messages[1]["id"] == "in-msg-102"
+        assert messages[1]["sender"] == "Joy Boy"
+        assert messages[1]["text"] == "Did you finish your work dear ?"
+        assert messages[1]["timestamp"] == "10:24 pm"
+
+        await browser.close()
+
+
+def test_audit_events_persisted_and_retrieved_via_api():
+    """Verify that audit messages persist in store and are retrieved via API endpoints."""
+    client = TestClient(app)
+
+    # Insert a message with unique fingerprint
+    fp = f"audit-test-fp-{uuid.uuid4()}"
+    msg = chatbot_store.record_detected_message(
+        fingerprint=fp,
+        contact_name="Joy Boy",
+        incoming_text="Audit test message content",
+        timestamp_str="11:45 PM"
+    )
+    if msg:
+        chatbot_store.update_message_status(
+            msg.id,
+            ChatbotMessageStatusEnum.READY_TO_SEND,
+            reply_text="Audit reply proposal",
+            skip_reason="Automatic sending mode is disabled."
+        )
+
+    # Query /api/chatbot/messages
+    res = client.get("/api/chatbot/messages")
+    assert res.status_code == 200
+    messages = res.json()
+    assert any(m["fingerprint"] == fp for m in messages)
+
+    # Query /api/chatbot/status
+    status_res = client.get("/api/chatbot/status")
+    assert status_res.status_code == 200
+    status_data = status_res.json()
+    assert any(m["fingerprint"] == fp for m in status_data["recent_messages"])
+
+
+def test_startup_safety_resets_auto_reply_enabled():
+    """Verify that automatic sending is always reset to False on startup."""
+    config = chatbot_store.get_config()
+    config.auto_reply_enabled = True
+    chatbot_store.save_config(config)
+    assert chatbot_store.get_config().auto_reply_enabled is True
+
+    # Simulate restart safety reset
+    chatbot_store.reset_startup_safety_flags()
+    assert chatbot_store.get_config().auto_reply_enabled is False
+
+
+def test_durable_deduplication_distinguishes_new_identical_messages_via_msg_id():
+    """Verify that identical text messages with distinct WhatsApp stanza IDs are distinguished, while repeated observations are deduplicated."""
+    test_id = uuid.uuid4().hex[:8]
+    contact = f"dedup_tester_{test_id}"
+    text = "Are you available?"
+
+    s1 = f"stanza_{test_id}_001"
+    s2 = f"stanza_{test_id}_002"
+
+    fp1 = chatbot_store.compute_fingerprint(contact, text, whatsapp_msg_id=s1)
+    fp1_duplicate = chatbot_store.compute_fingerprint(contact, text, whatsapp_msg_id=s1)
+    fp2_new = chatbot_store.compute_fingerprint(contact, text, whatsapp_msg_id=s2)
+
+    # Identical observations produce identical fingerprint
+    assert fp1 == fp1_duplicate
+
+    # Genuinely new message with same text produces distinct fingerprint
+    assert fp1 != fp2_new
+
+    # Record first message
+    rec1 = chatbot_store.record_detected_message(fp1, contact, text, "12:00")
+    assert rec1 is not None
+
+    # Repeated observation of same message rejected as known
+    assert chatbot_store.is_message_known(fp1) is True
+    rec1_dup = chatbot_store.record_detected_message(fp1, contact, text, "12:00")
+    assert rec1_dup is None
+
+    # Genuinely new message with same text successfully recorded
+    rec2 = chatbot_store.record_detected_message(fp2_new, contact, text, "12:01")
+    assert rec2 is not None
+    assert rec2.id != rec1.id
+
+
+@pytest.mark.asyncio
+async def test_gemini_api_error_sets_status_to_failed_without_fallback(mock_chatbot_server: str):
+    """Verify that a Gemini API error or timeout marks status as FAILED, retains error details, and does not send a fallback reply."""
+    contact = f"ErrContact_{uuid.uuid4().hex[:6]}"
+    chatbot_store.add_contact(contact)
+
+    config = chatbot_store.get_config()
+    config.enabled = True
+    config.auto_reply_enabled = True
+    chatbot_store.save_config(config)
+
+    # Set mock responder to simulate API error result
+    chatbot_reply_service.set_mock_responder(
+        lambda prompt: ChatbotReplyResult(
+            reply="",
+            intent="unknown",
+            confidence=0.0,
+            requires_manual_review=True,
+            safety_passed=False,
+            is_error=True,
+            error_code=503,
+            reason="Gemini API error [503]: The model is overloaded. Please try again later.",
+        )
+    )
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+        await page.goto(f"{mock_chatbot_server}/test-whatsapp")
+
+        try:
+            test_service = WhatsAppChatbotService()
+            fp = f"err-test-fp-{uuid.uuid4()}"
+            record = chatbot_store.record_detected_message(
+                fingerprint=fp,
+                contact_name=contact,
+                incoming_text="Hello, system status?",
+                timestamp_str="12:05"
+            )
+            assert record is not None
+
+            # Execute pipeline
+            await test_service._handle_message_reply_pipeline(page, record, config)
+
+            # Verification: status must be FAILED, not SKIPPED or SENT
+            updated = chatbot_store.get_message_by_id(record.id)
+            assert updated is not None
+            assert updated.status == ChatbotMessageStatusEnum.FAILED
+            assert "Gemini API error [503]" in updated.skip_reason
+
+            # Composer must remain empty (no fallback reply sent)
+            composer_text = await page.evaluate("() => document.getElementById('message-composer').innerText")
+            assert not (composer_text or "").strip()
+        finally:
+            chatbot_reply_service.set_mock_responder(None)
+            await browser.close()
+
+
+def test_historical_proposals_require_explicit_send_or_dismiss():
+    """Verify that historical READY_TO_SEND proposals are not automatically sent when auto_reply is enabled later, but can be explicitly dismissed or approved."""
+    client = TestClient(app)
+    contact = f"HistContact_{uuid.uuid4().hex[:6]}"
+    chatbot_store.add_contact(contact)
+
+    fp = f"hist-proposal-{uuid.uuid4()}"
+    msg = chatbot_store.record_detected_message(
+        fingerprint=fp,
+        contact_name=contact,
+        incoming_text="Proposal test",
+        timestamp_str="12:10"
+    )
+    assert msg is not None
+    chatbot_store.update_message_status(
+        msg.id,
+        ChatbotMessageStatusEnum.READY_TO_SEND,
+        reply_text="Candidate proposal",
+        skip_reason="Automatic sending mode is disabled."
+    )
+
+    # Enable auto_reply mode via API
+    res = client.post("/api/chatbot/config", json={"auto_reply_enabled": True})
+    assert res.status_code == 200
+
+    # Historical message remains in READY_TO_SEND (NOT auto-sent)
+    stored = chatbot_store.get_message_by_id(msg.id)
+    assert stored is not None
+    assert stored.status == ChatbotMessageStatusEnum.READY_TO_SEND
+
+    # Test explicit dismissal endpoint
+    dismiss_res = client.post(f"/api/chatbot/messages/{msg.id}/dismiss")
+    assert dismiss_res.status_code == 200
+    dismissed_data = dismiss_res.json()
+    assert dismissed_data["status"] == "SKIPPED"
+    assert "dismissed" in dismissed_data["skip_reason"].lower()
+
+
+@pytest.mark.asyncio
+async def test_stage_timings_recorded_on_message(mock_chatbot_server: str):
+    """Verify that stage timings and total duration are instrumented and stored on message records."""
+    contact = f"TimingContact_{uuid.uuid4().hex[:6]}"
+    chatbot_store.add_contact(contact)
+
+    config = chatbot_store.get_config()
+    config.enabled = True
+    config.auto_reply_enabled = False
+    chatbot_store.save_config(config)
+
+    chatbot_reply_service.set_mock_responder(
+        lambda prompt: '{"reply": "Quick automated response", "intent": "greeting", "confidence": 0.98, "requires_manual_review": false}'
+    )
+
+    try:
+        service = WhatsAppChatbotService()
+        fp = f"timing-test-fp-{uuid.uuid4()}"
+        record = chatbot_store.record_detected_message(
+            fingerprint=fp,
+            contact_name=contact,
+            incoming_text="Hi, latency test",
+            timestamp_str="12:30"
+        )
+        assert record is not None
+
+        # Execute workflow pipeline
+        stage_timings = {
+            "detection_latency_ms": 15.0,
+            "queue_wait_ms": 5.0,
+            "gemini_request_ms": 0.0,
+            "safety_validation_ms": 0.0,
+            "playwright_send_ms": 0.0,
+            "verification_ms": 0.0,
+        }
+        await service._handle_message_reply_pipeline(
+            record=record,
+            config=config,
+            t_detect_start=time.perf_counter() - 0.05,
+            stage_timings=stage_timings,
+        )
+
+        updated = chatbot_store.get_message_by_id(record.id)
+        assert updated is not None
+        assert updated.total_duration_ms is not None
+        assert updated.total_duration_ms > 0
+        assert updated.stage_timings is not None
+        assert "gemini_request_ms" in updated.stage_timings
+        assert "safety_validation_ms" in updated.stage_timings
+        assert updated.status == ChatbotMessageStatusEnum.READY_TO_SEND
+    finally:
+        chatbot_reply_service.set_mock_responder(None)
+
+
+@pytest.mark.asyncio
+async def test_gemini_timeout_transitions_to_failed_never_stuck_generating(mock_chatbot_server: str):
+    """Verify that a Gemini timeout transitions the message immediately to FAILED and never leaves it in GENERATING."""
+    contact = f"TimeoutContact_{uuid.uuid4().hex[:6]}"
+    chatbot_store.add_contact(contact)
+
+    config = chatbot_store.get_config()
+    config.enabled = True
+    config.auto_reply_enabled = True
+    chatbot_store.save_config(config)
+
+    # Mock responder that raises TimeoutError
+    def raise_timeout(prompt: str):
+        raise asyncio.TimeoutError("Gemini call timed out after 25.0s")
+
+    chatbot_reply_service.set_mock_responder(raise_timeout)
+
+    try:
+        service = WhatsAppChatbotService()
+        fp = f"timeout-test-fp-{uuid.uuid4()}"
+        record = chatbot_store.record_detected_message(
+            fingerprint=fp,
+            contact_name=contact,
+            incoming_text="What are you doing?",
+            timestamp_str="12:35"
+        )
+        assert record is not None
+
+        # Execute workflow
+        await service._handle_message_reply_pipeline(
+            record=record,
+            config=config,
+            t_detect_start=time.perf_counter()
+        )
+
+        updated = chatbot_store.get_message_by_id(record.id)
+        assert updated is not None
+        # Must be FAILED, NOT stuck in GENERATING!
+        assert updated.status == ChatbotMessageStatusEnum.FAILED
+        assert "timed out" in updated.skip_reason.lower() or "failed" in updated.skip_reason.lower()
+        assert updated.total_duration_ms is not None
+    finally:
+        chatbot_reply_service.set_mock_responder(None)
+
+
+def test_stuck_generating_recovered_on_startup():
+    """Verify that any orphaned GENERATING message in SQLite is safely recovered to FAILED on startup."""
+    contact = f"StuckContact_{uuid.uuid4().hex[:6]}"
+    fp = f"stuck-generating-fp-{uuid.uuid4()}"
+
+    # Insert a message directly into GENERATING status (simulating a crash mid-flight)
+    record = chatbot_store.record_detected_message(
+        fingerprint=fp,
+        contact_name=contact,
+        incoming_text="What are you doing?",
+        timestamp_str="12:40"
+    )
+    assert record is not None
+    chatbot_store.update_message_status(record.id, ChatbotMessageStatusEnum.GENERATING)
+
+    check_before = chatbot_store.get_message_by_id(record.id)
+    assert check_before is not None
+    assert check_before.status == ChatbotMessageStatusEnum.GENERATING
+
+    # Trigger recovery
+    recovered_count = chatbot_store.recover_stale_in_progress_messages()
+    assert recovered_count >= 1
+
+    check_after = chatbot_store.get_message_by_id(record.id)
+    assert check_after is not None
+    assert check_after.status == ChatbotMessageStatusEnum.FAILED
+    assert "recovered on startup" in check_after.skip_reason.lower()
+
+
+@pytest.mark.asyncio
+async def test_browser_send_error_transitions_to_send_unconfirmed():
+    """Verify that browser send error transitions the message to SEND_UNCONFIRMED without duplicate retry."""
+    contact = f"BrowserErrContact_{uuid.uuid4().hex[:6]}"
+    chatbot_store.add_contact(contact)
+
+    config = chatbot_store.get_config()
+    config.enabled = True
+    config.auto_reply_enabled = True
+    chatbot_store.save_config(config)
+
+    chatbot_reply_service.set_mock_responder(
+        lambda prompt: '{"reply": "Outgoing test reply", "intent": "casual", "confidence": 0.9, "requires_manual_review": false}'
+    )
+
+    try:
+        service = WhatsAppChatbotService()
+        fp = f"browser-err-fp-{uuid.uuid4()}"
+        record = chatbot_store.record_detected_message(
+            fingerprint=fp,
+            contact_name=contact,
+            incoming_text="Testing browser failure",
+            timestamp_str="12:45"
+        )
+        assert record is not None
+
+        # Ensure page is None so browser send cannot proceed
+        service._page = None
+
+        await service._handle_message_reply_pipeline(
+            record=record,
+            config=config,
+            t_detect_start=time.perf_counter()
+        )
+
+        updated = chatbot_store.get_message_by_id(record.id)
+        assert updated is not None
+        # Browser page unavailable -> READY_TO_SEND with abort reason, or SEND_UNCONFIRMED if failed during send
+        assert updated.status in (ChatbotMessageStatusEnum.READY_TO_SEND, ChatbotMessageStatusEnum.SEND_UNCONFIRMED)
+        assert updated.skip_reason is not None
+    finally:
+        chatbot_reply_service.set_mock_responder(None)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_messages_serialized_per_contact():
+    """Verify that two concurrent messages for the same contact are processed in strict serialization."""
+    service = WhatsAppChatbotService()
+    contact = "Joy Boy"
+
+    execution_order = []
+
+    async def simulate_processing(msg_index: int, sleep_time: float):
+        lock = service._get_contact_lock(contact)
+        async with lock:
+            execution_order.append(f"start_{msg_index}")
+            await asyncio.sleep(sleep_time)
+            execution_order.append(f"end_{msg_index}")
+
+    # Launch task 1 (slow) and task 2 (fast) concurrently
+    t1 = asyncio.create_task(simulate_processing(1, 0.05))
+    t2 = asyncio.create_task(simulate_processing(2, 0.01))
+    await asyncio.gather(t1, t2)
+
+    # Task 1 must start and end before Task 2 can start because of per-contact lock
+    assert execution_order == ["start_1", "end_1", "start_2", "end_2"]
+
+

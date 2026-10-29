@@ -187,6 +187,8 @@ export interface ChatbotMessageRecord {
   intent?: string | null;
   confidence?: number | null;
   skip_reason?: string | null;
+  total_duration_ms?: number | null;
+  stage_timings?: Record<string, number> | null;
   created_at: string;
   updated_at: string;
 }

@@ -261,4 +261,26 @@ export async function reconcileChatbotMessage(messageId: string, confirmed: bool
   return res.json();
 }
 
+export async function approveChatbotMessage(messageId: string): Promise<ChatbotMessageRecord> {
+  const res = await fetch(`${API_BASE}/api/chatbot/messages/${messageId}/send`, {
+    method: 'POST',
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || 'Failed to approve and send message');
+  }
+  return res.json();
+}
+
+export async function dismissChatbotMessage(messageId: string): Promise<ChatbotMessageRecord> {
+  const res = await fetch(`${API_BASE}/api/chatbot/messages/${messageId}/dismiss`, {
+    method: 'POST',
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || 'Failed to dismiss message proposal');
+  }
+  return res.json();
+}
+
 

@@ -268,6 +268,8 @@ class ChatbotMessageRecord(BaseModel):
     intent: Optional[str] = None
     confidence: Optional[float] = None
     skip_reason: Optional[str] = None
+    total_duration_ms: Optional[float] = None
+    stage_timings: Optional[Dict[str, float]] = None
     created_at: str
     updated_at: str
 

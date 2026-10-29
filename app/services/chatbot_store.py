@@ -69,10 +69,22 @@ class ChatbotStore:
                     intent TEXT,
                     confidence REAL,
                     skip_reason TEXT,
+                    total_duration_ms REAL,
+                    stage_timings TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
             """)
+            # Safe schema migrations for existing database files
+            try:
+                conn.execute("ALTER TABLE processed_messages ADD COLUMN total_duration_ms REAL")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute("ALTER TABLE processed_messages ADD COLUMN stage_timings TEXT")
+            except sqlite3.OperationalError:
+                pass
+
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_messages_contact_created
                 ON processed_messages(contact_name, created_at)
@@ -129,6 +141,40 @@ class ChatbotStore:
                     updated_at = excluded.updated_at
             """, (json.dumps(config_dict), now_iso))
             conn.commit()
+
+    def reset_startup_safety_flags(self) -> None:
+        """Enforce startup safety: always start the chatbot with automatic sending disabled and recover stale in-progress messages."""
+        config = self.get_config()
+        if config.auto_reply_enabled:
+            logger.info("Enforcing startup safety policy: resetting auto_reply_enabled to False.")
+            config.auto_reply_enabled = False
+            self.save_config(config)
+
+        # Recover any orphaned GENERATING or SENDING messages left by a previous crash or restart
+        recovered_count = self.recover_stale_in_progress_messages()
+        if recovered_count > 0:
+            logger.info(f"Recovered {recovered_count} orphaned in-progress message(s) from previous run.")
+
+    def recover_stale_in_progress_messages(self) -> int:
+        """Transition any messages orphaned in GENERATING or SENDING to safe terminal states."""
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self._lock, self._get_connection() as conn:
+            cur1 = conn.execute("""
+                UPDATE processed_messages
+                SET status = 'FAILED',
+                    skip_reason = 'Interrupted: application restarted while generating reply.',
+                    updated_at = ?
+                WHERE status = 'GENERATING'
+            """, (now_iso,))
+            cur2 = conn.execute("""
+                UPDATE processed_messages
+                SET status = 'SEND_UNCONFIRMED',
+                    skip_reason = 'Interrupted: application restarted while sending reply. Reconcile manually.',
+                    updated_at = ?
+                WHERE status = 'SENDING'
+            """, (now_iso,))
+            conn.commit()
+            return cur1.rowcount + cur2.rowcount
 
     # =========================================================================
     # Contact Allowlist Management
@@ -221,15 +267,31 @@ class ChatbotStore:
     # =========================================================================
 
     @staticmethod
-    def compute_fingerprint(contact_name: str, text: str, timestamp_str: str, dom_context: str = "") -> str:
+    def compute_fingerprint(
+        contact_name: str,
+        text: str,
+        timestamp_str: str = "",
+        dom_context: str = "",
+        whatsapp_msg_id: str = "",
+    ) -> str:
         """Generate a deterministic, durable cryptographic fingerprint for an incoming message.
 
-        Incorporates sender name, message content, timestamp / DOM metadata, and context.
-        Limitations: WhatsApp Web virtualizes chat bubbles and does not always expose server-assigned
-        UUIDs in the DOM. Hence, identical text sent by the same user within the same minute or DOM context
-        will produce the same fingerprint (which protects against duplicate replies).
+        Incorporates the strong WhatsApp message identifier (stanza data-id) as the primary key.
+        If unavailable, uses a canonical combination of contact, text content, and DOM timestamp.
+        Never relies on wall-clock time so that re-observations during polling are stably deduplicated.
         """
-        raw = f"{contact_name.strip().lower()}:{text.strip()}:{timestamp_str.strip()}:{dom_context.strip()}"
+        clean_contact = contact_name.strip().lower()
+        clean_msg_id = whatsapp_msg_id.strip()
+
+        if clean_msg_id:
+            raw = f"{clean_contact}:msg_id:{clean_msg_id}"
+            return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+        # Fallback for synthetic / test DOM environments without WhatsApp stanza IDs
+        clean_text = text.strip()
+        clean_time = timestamp_str.strip()
+        clean_ctx = dom_context.strip()
+        raw = f"{clean_contact}:content:{clean_text}:{clean_time}:{clean_ctx}"
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     def is_message_known(self, fingerprint: str) -> bool:
@@ -283,6 +345,36 @@ class ChatbotStore:
                 # Fingerprint collision: message already processed or being processed
                 return None
 
+    @staticmethod
+    def _row_to_record(row: sqlite3.Row) -> ChatbotMessageRecord:
+        timings = None
+        if "stage_timings" in row.keys() and row["stage_timings"]:
+            try:
+                timings = json.loads(row["stage_timings"])
+            except Exception:
+                timings = None
+
+        total_dur = None
+        if "total_duration_ms" in row.keys():
+            total_dur = row["total_duration_ms"]
+
+        return ChatbotMessageRecord(
+            id=row["id"],
+            fingerprint=row["fingerprint"],
+            contact_name=row["contact_name"],
+            incoming_text=row["incoming_text"],
+            timestamp_str=row["timestamp_str"],
+            status=ChatbotMessageStatusEnum(row["status"]),
+            reply_text=row["reply_text"],
+            intent=row["intent"],
+            confidence=row["confidence"],
+            skip_reason=row["skip_reason"],
+            total_duration_ms=total_dur,
+            stage_timings=timings,
+            created_at=row["created_at"],
+            updated_at=row["updated_at"]
+        )
+
     def update_message_status(
         self,
         message_id: str,
@@ -290,10 +382,13 @@ class ChatbotStore:
         reply_text: Optional[str] = None,
         intent: Optional[str] = None,
         confidence: Optional[float] = None,
-        skip_reason: Optional[str] = None
+        skip_reason: Optional[str] = None,
+        total_duration_ms: Optional[float] = None,
+        stage_timings: Optional[dict] = None
     ) -> bool:
-        """Atomically update a message's state."""
+        """Atomically update a message's state and optional stage timing metrics."""
         now_iso = datetime.now(timezone.utc).isoformat()
+        timings_json = json.dumps(stage_timings) if stage_timings is not None else None
         with self._lock, self._get_connection() as conn:
             cursor = conn.execute("""
                 UPDATE processed_messages
@@ -302,6 +397,8 @@ class ChatbotStore:
                     intent = COALESCE(?, intent),
                     confidence = COALESCE(?, confidence),
                     skip_reason = COALESCE(?, skip_reason),
+                    total_duration_ms = COALESCE(?, total_duration_ms),
+                    stage_timings = COALESCE(?, stage_timings),
                     updated_at = ?
                 WHERE id = ?
             """, (
@@ -310,6 +407,8 @@ class ChatbotStore:
                 intent,
                 confidence,
                 skip_reason,
+                total_duration_ms,
+                timings_json,
                 now_iso,
                 message_id
             ))
@@ -336,44 +435,26 @@ class ChatbotStore:
                 ORDER BY created_at DESC
                 LIMIT ?
             """, (limit,)).fetchall()
-            return [
-                ChatbotMessageRecord(
-                    id=r["id"],
-                    fingerprint=r["fingerprint"],
-                    contact_name=r["contact_name"],
-                    incoming_text=r["incoming_text"],
-                    timestamp_str=r["timestamp_str"],
-                    status=ChatbotMessageStatusEnum(r["status"]),
-                    reply_text=r["reply_text"],
-                    intent=r["intent"],
-                    confidence=r["confidence"],
-                    skip_reason=r["skip_reason"],
-                    created_at=r["created_at"],
-                    updated_at=r["updated_at"]
-                )
-                for r in rows
-            ]
+            return [self._row_to_record(r) for r in rows]
 
     def get_message_by_id(self, message_id: str) -> Optional[ChatbotMessageRecord]:
         """Retrieve a message record by its unique ID."""
         with self._lock, self._get_connection() as conn:
             row = conn.execute("SELECT * FROM processed_messages WHERE id = ?", (message_id,)).fetchone()
             if row:
-                return ChatbotMessageRecord(
-                    id=row["id"],
-                    fingerprint=row["fingerprint"],
-                    contact_name=row["contact_name"],
-                    incoming_text=row["incoming_text"],
-                    timestamp_str=row["timestamp_str"],
-                    status=ChatbotMessageStatusEnum(row["status"]),
-                    reply_text=row["reply_text"],
-                    intent=row["intent"],
-                    confidence=row["confidence"],
-                    skip_reason=row["skip_reason"],
-                    created_at=row["created_at"],
-                    updated_at=row["updated_at"]
-                )
+                return self._row_to_record(row)
             return None
+
+    def dismiss_message(self, message_id: str, reason: Optional[str] = None) -> Optional[ChatbotMessageRecord]:
+        """Dismiss a proposal without sending, updating status to SKIPPED."""
+        msg = self.get_message_by_id(message_id)
+        if not msg:
+            return None
+        if msg.status == ChatbotMessageStatusEnum.SENT:
+            return msg
+        skip_msg = reason or "Proposal dismissed by user without sending."
+        self.update_message_status(message_id, ChatbotMessageStatusEnum.SKIPPED, skip_reason=skip_msg)
+        return self.get_message_by_id(message_id)
 
     def reconcile_unconfirmed_message(self, message_id: str, confirmed: bool, notes: Optional[str] = None) -> Optional[ChatbotMessageRecord]:
         """Resolve a SEND_UNCONFIRMED message outcome following conversation reconciliation."""

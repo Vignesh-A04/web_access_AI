@@ -312,6 +312,24 @@ async def reconcile_chatbot_message(message_id: str, req: ChatbotReconcileReques
     return reconciled
 
 
+@api_router.post("/api/chatbot/messages/{message_id}/send", response_model=ChatbotMessageRecord, tags=["Chatbot"])
+async def send_approved_chatbot_message(message_id: str):
+    """Explicitly approve and send a single READY_TO_SEND candidate reply proposal."""
+    updated = await chatbot_service.send_approved_reply(message_id)
+    if not updated:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Message '{message_id}' not found")
+    return updated
+
+
+@api_router.post("/api/chatbot/messages/{message_id}/dismiss", response_model=ChatbotMessageRecord, tags=["Chatbot"])
+async def dismiss_chatbot_message(message_id: str):
+    """Explicitly dismiss a candidate reply proposal without sending it."""
+    dismissed = chatbot_store.dismiss_message(message_id)
+    if not dismissed:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Message '{message_id}' not found")
+    return dismissed
+
+
 
 def generate_mock_whatsapp_html(mode: Optional[str] = None) -> str:
     """Generate mock WhatsApp Web DOM for automated testing and offline verification."""

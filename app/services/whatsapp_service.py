@@ -647,7 +647,7 @@ class WhatsAppAutomationService:
         return unique_candidates
 
     async def _click_contact_item(self, page: Page, contact_name: str, timeout: int = 10) -> None:
-        """Click on the contact in the search results list."""
+        """Click on the contact in the search results or recent chat list."""
         active_header = await self._get_active_chat_header_name(page, timeout=1)
         if active_header and active_header.strip().lower() == contact_name.strip().lower():
             # Already active chat window
@@ -656,16 +656,38 @@ class WhatsAppAutomationService:
         contact_loc = page.locator(
             f"#side span[title='{contact_name}'], "
             f"#side div[data-testid='cell-frame-container']:has-text('{contact_name}'), "
+            f"#side div[data-testid^='list-item-']:has-text('{contact_name}'), "
             f"#side span:has-text('{contact_name}'), "
             f".contact-item:has-text('{contact_name}')"
         ).first
-        if await contact_loc.count() == 0:
-            contact_loc = page.locator(f"span[title='{contact_name}']").first
+        if await contact_loc.count() > 0:
+            await contact_loc.click()
+            await asyncio.sleep(1.0)
+            return
 
-        if await contact_loc.count() == 0:
+        # Fallback: JavaScript evaluate click for case-insensitive match
+        clicked = await page.evaluate("""
+            (targetName) => {
+                const clean = targetName.trim().toLowerCase();
+                const items = document.querySelectorAll(
+                    '#side div[data-testid^="list-item-"], #side div[data-testid="cell-frame-container"], #side [role="row"], .contact-item'
+                );
+                for (const item of items) {
+                    const titleEl = item.querySelector(
+                        'span[data-testid="cell-frame-title"] span, span[dir="auto"], span[title], .chat-title, .contact-name'
+                    );
+                    const name = titleEl ? (titleEl.getAttribute('title') || titleEl.innerText || '').trim().toLowerCase() : '';
+                    if (name && (name === clean || name.includes(clean))) {
+                        item.click();
+                        return true;
+                    }
+                }
+                return false;
+            }
+        """, contact_name)
+
+        if not clicked:
             raise WhatsAppAutomationError(f"Could not click contact element for '{contact_name}'.")
-
-        await contact_loc.click()
         await asyncio.sleep(1.0)
 
     async def _get_active_chat_header_name(self, page: Page, timeout: int = 10) -> Optional[str]:
@@ -767,6 +789,9 @@ class WhatsAppAutomationService:
 
     async def _verify_message_sent_in_chat(self, page: Page, message_text: str, timeout: int = 15) -> Tuple[bool, str]:
         """Verify that the outgoing message bubble appears in the conversation history."""
+        clean_text = message_text.strip()
+        start_time = asyncio.get_event_loop().time()
+
         outgoing_selectors = [
             "#main div.message-out",
             "#main div[data-testid='msg-container']:has(div.message-out)",
@@ -774,20 +799,56 @@ class WhatsAppAutomationService:
             ".message-bubble-out",
         ]
 
-        start_time = asyncio.get_event_loop().time()
         while asyncio.get_event_loop().time() - start_time < timeout:
+            # 1. Fast check via JavaScript evaluation handling both Real WhatsApp Web and mock DOM
+            try:
+                verified = await page.evaluate("""
+                    (targetText) => {
+                        const rows = document.querySelectorAll(
+                            '#main [role="row"], #main div.message-out, #main div[data-testid="msg-container"], .message-bubble-out'
+                        );
+                        for (let i = rows.length - 1; i >= Math.max(0, rows.length - 12); i--) {
+                            const row = rows[i];
+                            const isOut = (
+                                row.classList.contains('message-out') ||
+                                row.querySelector('.message-out') !== null ||
+                                row.querySelector('[data-testid="tail-out"]') !== null ||
+                                row.querySelector('[data-icon="tail-out"]') !== null ||
+                                row.querySelector('[aria-label="You:"]') !== null ||
+                                row.querySelector('[aria-label="You"]') !== null ||
+                                row.querySelector('[data-testid="msg-check"]') !== null ||
+                                row.querySelector('[data-testid="msg-dblcheck"]') !== null ||
+                                row.querySelector('[data-testid="msg-dblcheck-ack"]') !== null ||
+                                (row.querySelector('[data-pre-plain-text]') && row.querySelector('[data-pre-plain-text]').getAttribute('data-pre-plain-text').includes('You:'))
+                            );
+                            if (isOut) {
+                                const txt = (row.innerText || '').trim();
+                                if (txt.includes(targetText) || targetText.includes(txt)) {
+                                    return true;
+                                }
+                            }
+                        }
+                        return false;
+                    }
+                """, clean_text)
+                if verified:
+                    return True, f"Outgoing message verified in active chat bubble ({len(clean_text)} chars)."
+            except Exception:
+                pass
+
+            # 2. Fallback check via Playwright locators
             for sel in outgoing_selectors:
                 try:
                     loc = page.locator(sel)
                     count = await loc.count()
                     if count > 0:
-                        # Inspect the last outgoing bubble
                         last_bubble = loc.nth(count - 1)
                         bubble_text = (await last_bubble.inner_text() or "").strip()
-                        if message_text in bubble_text or message_text.strip() == bubble_text:
-                            return True, f"Outgoing message verified in active chat bubble ({len(message_text)} chars)."
+                        if clean_text in bubble_text or clean_text == bubble_text:
+                            return True, f"Outgoing message verified in active chat bubble ({len(clean_text)} chars)."
                 except Exception:
                     pass
+
             await asyncio.sleep(0.5)
 
         return False, "Timed out waiting for outgoing message bubble to appear in conversation history."
